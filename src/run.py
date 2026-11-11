@@ -1,6 +1,11 @@
-"""Run one MNIST training experiment and dump a JSON log.
+"""Run one MNIST / Fashion-MNIST training experiment and dump a JSON log.
 
-Network: the paper's MNIST classifier, 784-500-ReLU-10 (397,510 params).
+Networks (--arch):
+  paper  the paper's MNIST classifier, 784-500-ReLU-10 (397,510 params)
+  deep   784-512-256-128-10 MLP (567,434 params)
+  cnn    the paper's F-MNIST network: conv(1->10, 5x5)-maxpool-ReLU,
+         conv(10->20, 5x5)-maxpool-ReLU, linear 320->50-ReLU, linear 50->10
+         (21,840 params; the classic PyTorch MNIST example the paper's table follows)
 Dropout is omitted on purpose: with dropout the ARC ratio test
 rho = (f(x) - f(x+s)) / pred compares two different random sub-networks,
 which would mix optimizer noise with dropout noise.
@@ -23,41 +28,64 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arcs_lsr1 import ARCsLSR1  # noqa: E402
+from baselines import FlatMuon, FlatShampoo, FlatSophiaG  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARCHS = {
     "paper": [784, 500, 10],  # the paper's MNIST classifier, 397,510 params
     "deep": [784, 512, 256, 128, 10],  # 4 linear layers, 567,434 params
+    "cnn": None,  # the paper's F-MNIST CNN, 21,840 params
 }
+CNN_SHAPES = [(10, 1, 5, 5), (10,), (20, 10, 5, 5), (20,), (50, 320), (50,), (10, 50), (10,)]
+ARCH = "paper"
 WIDTHS = ARCHS["paper"]
 SHAPES, LAYER_BLOCKS, N_PARAMS = [], [], 0
 
 
 def set_arch(name):
-    global WIDTHS, SHAPES, LAYER_BLOCKS, N_PARAMS
+    """Set the network; every layer (weight + bias) is one block."""
+    global ARCH, WIDTHS, SHAPES, LAYER_BLOCKS, N_PARAMS
+    ARCH = name
     WIDTHS = ARCHS[name]
-    SHAPES, LAYER_BLOCKS, i = [], [], 0
-    for a, b in zip(WIDTHS[:-1], WIDTHS[1:]):
-        SHAPES += [(b, a), (b,)]
-        LAYER_BLOCKS.append((i, i + a * b + b))
-        i += a * b + b
+    if name == "cnn":
+        SHAPES = list(CNN_SHAPES)
+    else:
+        SHAPES = []
+        for a, b in zip(WIDTHS[:-1], WIDTHS[1:]):
+            SHAPES += [(b, a), (b,)]
+    LAYER_BLOCKS, i = [], 0
+    for w, b in zip(SHAPES[0::2], SHAPES[1::2]):
+        n = math.prod(w) + math.prod(b)
+        LAYER_BLOCKS.append((i, i + n))
+        i += n
     N_PARAMS = i
 
 
 set_arch("paper")
 
 
+DATA = {  # name -> (torchvision class, normalisation mean, std, cache file)
+    "mnist": ("MNIST", 0.1307, 0.3081, "mnist_tensors.pt"),
+    "fmnist": ("FashionMNIST", 0.2860, 0.3530, "fmnist_tensors.pt"),
+}
+
+
 def load_mnist():
-    cache = os.path.join(ROOT, "data", "mnist_tensors.pt")
+    return load_data("mnist")
+
+
+def load_data(name="mnist"):
+    cls, mean, std, fname = DATA[name]
+    cache = os.path.join(ROOT, "data", fname)
     if os.path.exists(cache):
         return torch.load(cache)
     from torchvision import datasets
 
-    tr = datasets.MNIST(os.path.join(ROOT, "data"), train=True, download=True)
-    te = datasets.MNIST(os.path.join(ROOT, "data"), train=False, download=True)
+    tr = getattr(datasets, cls)(os.path.join(ROOT, "data"), train=True, download=True)
+    te = getattr(datasets, cls)(os.path.join(ROOT, "data"), train=False, download=True)
 
     def prep(ds):
-        x = ds.data.float().div(255.0).sub(0.1307).div(0.3081).reshape(-1, 784)
+        x = ds.data.float().div(255.0).sub(mean).div(std).reshape(-1, 784)
         return x.contiguous(), ds.targets.clone()
 
     out = (*prep(tr), *prep(te))
@@ -67,7 +95,10 @@ def load_mnist():
 
 def init_params(seed):
     torch.manual_seed(seed)
-    layers = [nn.Linear(a, b) for a, b in zip(WIDTHS[:-1], WIDTHS[1:])]
+    if ARCH == "cnn":
+        layers = [nn.Conv2d(1, 10, 5), nn.Conv2d(10, 20, 5), nn.Linear(320, 50), nn.Linear(50, 10)]
+    else:
+        layers = [nn.Linear(a, b) for a, b in zip(WIDTHS[:-1], WIDTHS[1:])]
     return torch.cat([p.detach().reshape(-1) for l in layers for p in (l.weight, l.bias)]).contiguous()
 
 
@@ -82,6 +113,12 @@ def unflat(x):
 
 def forward(x, X):
     ps = unflat(x)
+    if ARCH == "cnn":
+        h = X.view(-1, 1, 28, 28)
+        h = F.relu(F.max_pool2d(F.conv2d(h, ps[0], ps[1]), 2))
+        h = F.relu(F.max_pool2d(F.conv2d(h, ps[2], ps[3]), 2))
+        h = F.relu(F.linear(h.flatten(1), ps[4], ps[5]))
+        return F.linear(h, ps[6], ps[7])
     h = X
     nl = len(ps) // 2
     for i in range(nl):
@@ -137,8 +174,10 @@ def model_flops_per_sample():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--opt", default="arcs", choices=["arcs", "sgd", "adam"])
+    ap.add_argument("--opt", default="arcs", choices=["arcs", "sgd", "adam", "adamw", "muon", "shampoo", "sophia"])
+    ap.add_argument("--wd", type=float, default=0.01, help="decoupled weight decay for adamw/muon/shampoo/sophia")
     ap.add_argument("--arch", default="paper", choices=list(ARCHS))
+    ap.add_argument("--data", default="mnist", choices=list(DATA))
     ap.add_argument("--mu_per_layer", action="store_true")
     ap.add_argument("--hess_beta", type=float, default=0.0)
     ap.add_argument("--rank_cap", type=int, default=0)
@@ -166,7 +205,7 @@ def main():
 
     torch.set_num_threads(a.threads)
     set_arch(a.arch)
-    Xtr, Ttr, Xte, Tte = load_mnist()
+    Xtr, Ttr, Xte, Tte = load_data(a.data)
     x = init_params(a.seed)
     x0 = x.clone()
 
@@ -203,8 +242,16 @@ def main():
         xp = x.clone().requires_grad_(True)
         if a.opt == "sgd":
             topt = torch.optim.SGD([xp], lr=a.lr or 0.1, momentum=0.9)
-        else:
+        elif a.opt == "adam":
             topt = torch.optim.Adam([xp], lr=a.lr or 1e-3, eps=1e-6)
+        elif a.opt == "adamw":
+            topt = torch.optim.AdamW([xp], lr=a.lr or 1e-3, weight_decay=a.wd)
+        elif a.opt == "muon":
+            topt = FlatMuon(xp, SHAPES, lr=a.lr or 0.02, wd=a.wd)
+        elif a.opt == "shampoo":
+            topt = FlatShampoo(xp, SHAPES, lr=a.lr or 1e-3, wd=a.wd)
+        else:
+            topt = FlatSophiaG(xp, lr=a.lr or 3e-4, wd=a.wd)
 
     log = {"args": vars(a), "name": name, "iters": [], "probes": [], "epochs": []}
     F_FWD, F_FB = model_flops_per_sample()
@@ -244,10 +291,26 @@ def main():
                 topt.zero_grad()
                 L = loss_fn(xp, Xb, Tb)
                 L.backward()
-                topt.step()
+                if a.opt == "sophia":
+                    if topt.wants_hessian():
+                        # Gauss-Newton-Bartlett estimate: gradient at labels sampled from the model
+                        g_keep = xp.grad.clone()
+                        logits = forward(xp, Xb)
+                        ys = torch.distributions.Categorical(logits=logits.detach()).sample()
+                        (gs,) = torch.autograd.grad(F.cross_entropy(logits, ys), xp)
+                        topt.update_hessian(gs)
+                        xp.grad = g_keep
+                        n_grad += 1
+                    topt.step(a.bs)
+                else:
+                    topt.step()
                 n_grad += 1
                 if it % 10 == 0:
-                    log["iters"].append({"it": it, "loss": float(L)})
+                    # per-batch improvement f_B(x_k) - f_B(x_k+1), comparable with the ARCs logs
+                    # (diagnostic forward pass, not counted in the overhead numbers)
+                    with torch.no_grad():
+                        L_after = float(loss_fn(xp, Xb, Tb))
+                    log["iters"].append({"it": it, "loss": float(L), "loss_after": L_after})
             if a.max_iters and it >= a.max_iters:
                 stop = True
                 break

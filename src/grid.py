@@ -70,6 +70,27 @@ for m in (1, 2):
 SECANT = {f"deep_secant_m2_hb{hb}": LM + f"--history 2 --hess_beta {hb} --rank_cap 4" if hb else LM + "--history 2"
           for hb in (0.0, 0.1, 0.3, 0.5, 0.7, 0.9)}
 
+# round 5: the paper's F-MNIST CNN (21,840 params, 4 layer blocks)
+C = "--arch cnn --data fmnist --probe_every 100 "
+FMNIST = {
+    "fm_sgd": C + "--opt sgd",
+    "fm_adam": C + "--opt adam",
+    "fm_full_same": C + "--opt arcs --y_mode same",
+    "fm_full_cross": C + "--opt arcs --y_mode cross",
+    "fm_layer_same": C + "--opt arcs --y_mode same --per_layer",
+    "fm_layer_cross": C + "--opt arcs --y_mode cross --per_layer",
+    "fm_layermu_floor_same": C + "--opt arcs --y_mode same --per_layer --mu_per_layer --mu_floor_kappa 1",
+    "fm_layermu_floor_cross": C + "--opt arcs --y_mode cross --per_layer --mu_per_layer --mu_floor_kappa 1",
+    "fm_layer_same_m2": C + "--opt arcs --y_mode same --per_layer --history 2",
+    "fm_layermu_floor_same_m2": C + "--opt arcs --y_mode same --per_layer --mu_per_layer --mu_floor_kappa 1 --history 2",
+}
+
+# round 6: modern baselines with a learning-rate sweep (seed 0), then 2 more seeds at the best lr
+LRS = {"adamw": (3e-4, 1e-3, 3e-3), "muon": (0.005, 0.02, 0.05), "shampoo": (3e-4, 1e-3, 3e-3),
+       "sophia": (3e-4, 1e-3, 3e-3)}
+MODERN_MNIST = {f"deep_{o}_lr{lr:g}": D + f"--opt {o} --lr {lr:g}" for o, lrs in LRS.items() for lr in lrs}
+MODERN_FMNIST = {f"fm_{o}_lr{lr:g}": C + f"--opt {o} --lr {lr:g}" for o, lrs in LRS.items() for lr in lrs}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -79,7 +100,8 @@ def main():
     ap.add_argument("--bs", default="64,256,1024")
     ap.add_argument("--seeds", default="0,1,2")
     ap.add_argument("--only", default="", help="comma list of config names")
-    ap.add_argument("--suite", default="main", choices=["main", "layer", "memory", "fix", "flip", "secant"])
+    ap.add_argument("--suite", default="main", choices=["main", "layer", "memory", "fix", "flip", "secant", "fmnist",
+                                                   "modern_mnist", "modern_fmnist"])
     a = ap.parse_args()
     outdir = os.path.join(ROOT, "results")
     logdir = os.path.join(ROOT, "results", "logs")
@@ -96,6 +118,12 @@ def main():
         confs = FIX
     elif a.suite == "flip":
         confs = FLIP
+    elif a.suite == "fmnist":
+        confs = FMNIST
+    elif a.suite == "modern_mnist":
+        confs = MODERN_MNIST
+    elif a.suite == "modern_fmnist":
+        confs = MODERN_FMNIST
     else:
         confs = SECANT
     if a.only:

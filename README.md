@@ -234,6 +234,109 @@ So along each new step, the previous model's prediction is about 62% off, and fa
 - **In wall time it is 9–17× slower** in this implementation. The optimizer step takes 22–46 ms vs 7–11 ms for the model. That time does not scale with FLOPs (m = 2 has 1/5 of the FLOPs of m = 10 but takes half the time), so it is dominated by float64 O(n) vector operations and Python overhead.
 - A float32, fused, or GPU implementation should bring the wall time much closer to the FLOP ratio.
 
+### Training response vs. the weight on B_new
+
+Same runs as above (m = 2, rank cap 4) plus m = 10, SGD and Adam. Full table: [results/summary_training.md](results/summary_training.md), [fig 9](figures/fig9_training_alpha.png).
+- "Per-batch improvement" is f_B(x_k) − f_B(x_{k+1}), measured on the batch the step was computed on.
+
+| method | train loss, epoch 1 | epoch 3 | epoch 10 (mean ± sd) | per-batch improvement, epoch 1 / 5 / 10 |
+|---|---|---|---|---|
+| m = 2, w = 0.1 | 0.275 | 0.074 | 0.0023 ± 0.0007 | 22 / 75 / 79 % |
+| m = 2, w = 0.5 | 0.190 | 0.105 | 0.0027 ± 0.0008 | 26 / 76 / 82 % |
+| m = 2, w = 0.7 | 0.231 | 0.077 | 0.0026 ± 0.0010 | 24 / 75 / 81 % |
+| m = 2, w = 0.9 | 0.277 | 0.096 | 0.0031 ± 0.0013 | 21 / 73 / 82 % |
+| m = 2, plain L-SR1 | 0.233 | 0.116 | 0.0043 ± 0.0007 | 21 / 73 / 82 % |
+| SGD + momentum | 0.106 | 0.047 | 0.0106 ± 0.0022 | – |
+| Adam | 0.129 | 0.048 | 0.0111 ± 0.0017 | – |
+
+**1. Hessian momentum lowers the final training loss, but the size of w barely matters.**
+- With any w < 1, the final training loss is 0.0023–0.0031, vs 0.0043 for plain m = 2. That's about 2–3 sd, which is suggestive with only 3 seeds.
+- Among the w values there is no clear ordering, and the per-batch improvement is nearly identical.
+- This is the opposite of test accuracy, where plain m = 2 was best.
+
+**2. Against SGD and Adam, ARCs is slower early but finishes lower.**
+- It has a higher training loss in epochs 1–5, crosses over around epochs 6–7, and ends 3–4× lower.
+- Per wall time, SGD and Adam reach a training loss of 0.01 about 10× sooner.
+- SGD and Adam use the paper's fixed learning rates without decay, so part of the late gap may come from their plateau.
+
+## Round 5: F-MNIST with the paper's CNN (21,840 params, 4 layer blocks, 10 epochs, 3 seeds)
+
+Full table: [results/summary_fmnist.md](results/summary_fmnist.md), [fig 8](figures/fig8_fmnist.png). Test accuracy %, with the final training loss in parentheses:
+
+| method | batch 64 | batch 256 |
+|---|---|---|
+| SGD + momentum (lr 0.1) | 83.06 ± 0.48 (0.43) | 87.89 ± 0.73 (0.26) |
+| Adam (lr 1e-3) | **90.03 ± 0.29 (0.20)** | **88.60 ± 0.12 (0.27)** |
+| ARCs-LSR1, full network, m = 10 | 73.40 ± 1.62 (0.71) | 81.54 ± 2.89 (0.46) |
+| per-layer models, shared μ, m = 10 | 76.39 ± 1.88 (0.60) | 81.49 ± 1.45 (0.49) |
+| per-layer μ_l + floor, m = 10 | 75.67 ± 1.52 (0.61) | 83.93 ± 0.79 (0.39) |
+| per-layer models, shared μ, m = 2 | 76.25 ± 2.36 (0.63) | 83.34 ± 1.69 (0.42) |
+| per-layer μ_l + floor, m = 2 | 76.78 ± 3.48 (0.69) | 85.58 ± 0.34 (0.34) |
+| full network, cross-batch y | 54.84 ± 6.96 (1.21) | 67.60 ± 3.46 (0.84) |
+
+**1. On this harder problem every ARCs-LSR1 variant is behind SGD and Adam,** in training loss as well as test accuracy.
+- At batch 64, the ARCs training loss stays flat around 0.6 after the first epoch.
+- The best variant (μ_l per layer + floor, m = 2, batch 256) still trails Adam by 3 points.
+
+**2. Why: each step overfits its mini-batch.**
+- Per batch, ARCs looks far better than the baselines. At batch 64, a step removes 29–45% of the current batch's loss, vs 13% for SGD and 3–6% for Adam.
+- The model predicts removing 70–80% (pred / f ≈ 0.7–0.8), and about half of that is realized (ρ ≈ 0.4–0.5).
+- But the model, the curvature pair and the ratio test all see only the current batch. So the step is tuned to fit that batch at the cost of the others, and the full objective barely moves.
+- This is the same mechanism as the per-layer μ_l failure in round 2. On MNIST the per-batch decrease was even larger (~80%), but the bigger MLP generalized anyway.
+
+**3. Consequence for measuring training response:** the per-batch improvement can be misleading. The full training objective is the measure to compare.
+
+**4. Cross-batch y is much worse here too,** as on MNIST.
+
+## Round 6: modern baselines (AdamW, Muon, Shampoo, SophiaG)
+
+Implementations: `src/baselines.py`, tested in `src/test_baselines.py`.
+- **AdamW:** `torch.optim.AdamW`.
+- **Muon:** Newton–Schulz orthogonalized Nesterov momentum on the hidden weight matrices, with AdamW for the output layer and biases, as the Muon authors recommend. It reproduces `torch.optim.Muon` bitwise when both run in bfloat16; float32 is used here.
+- **Shampoo:** Kronecker-factored preconditioner L^{-1/4} M R^{-1/4}, with the step size per layer grafted from Adam. The preconditioner is recomputed every 10 steps.
+- **SophiaG:** clipped diagonal Gauss–Newton preconditioning, with the Gauss–Newton–Bartlett estimate every 10 steps.
+- All four use decoupled weight decay 0.01.
+
+**Tuning:** each one's learning rate was chosen by the lowest final **training** loss on seed 0, so the test set was not used. Whenever the best rate was at an edge of the range tried, the sweep was extended by a factor of 3 until it was inside. Seeds 1 and 2 then used the chosen rate. Choices and every rate tried: [results/round6_selection.json](results/round6_selection.json).
+
+Full tables: [results/summary_modern.md](results/summary_modern.md), [fig 10](figures/fig10_modern_baselines.png). Test accuracy %, with the final training loss in parentheses:
+
+| method | MNIST, deep MLP, bs 256 | F-MNIST, CNN, bs 64 | F-MNIST, CNN, bs 256 |
+|---|---|---|---|
+| ARCs-LSR1, full network, m = 10 | 98.31 (0.0026) | 73.40 (0.71) | 81.54 (0.46) |
+| ARCs-LSR1, per-layer μ_l, m = 2 (+ floor on F-MNIST) | 98.39 (0.0043) | 76.78 (0.69) | 85.58 (0.34) |
+| AdamW | 97.92 (0.016) | 89.55 (0.20) | 89.79 (0.21) |
+| **Muon** | **98.45 (0.0001)** | **90.25 (0.13)** | **90.42 (0.14)** |
+| **Shampoo** | **98.47 (0.0005)** | 90.06 (0.14) | 89.82 (0.15) |
+| SophiaG | 97.88 (0.014) | 89.97 (0.18) | 89.76 (0.20) |
+| SGD + momentum (paper) | 98.05 (0.011) | 83.06 (0.43) | 87.89 (0.26) |
+| Adam (paper) | 98.14 (0.011) | 90.03 (0.20) | 88.60 (0.27) |
+
+**1. Against tuned modern optimizers, ARCs-LSR1 is behind everywhere.**
+- On MNIST, Muon and Shampoo beat it in training loss as well as accuracy. Muon's final training loss is 26× lower.
+- So the lower final training loss that ARCs showed against the paper's SGD and Adam does not survive stronger baselines.
+- On F-MNIST the gap is 4–17 points of accuracy.
+
+**2. Muon and Shampoo are the strongest baselines here,** both on the training objective and on accuracy.
+
+**3. Fairness caveats.**
+- The ARCs hyperparameters (μ₀, η₁, η₂, the γ rule) were **not** tuned per problem, while the baselines' learning rates were.
+- Every result here is 10 epochs, with no learning-rate schedules.
+
+**Overhead per epoch, relative to SGD** (idle machine, 8 threads, batch 256: [results/overhead.md](results/overhead.md), [results/overhead_cnn.md](results/overhead_cnn.md)):
+
+| optimizer | deep MLP (567k params) | CNN (22k params) |
+|---|---|---|
+| AdamW / SophiaG | 1.2× / 1.3× | 0.9× / 1.0× |
+| Muon / Shampoo | 4.7× / 4.5× | 0.9× / 1.0× |
+| ARCs-LSR1, full network, m = 10 | 12.5× | 1.9× |
+| ARCs-LSR1, per-layer μ_l, m = 2 | 8.5× | 3.4× |
+| ARCs-LSR1, per-layer μ_l + floor, m = 10 | 17.9× | 4.7× |
+
+- **On the small CNN,** the optimizer algebra is cheap, so full-network ARCs is close to its FLOP ratio of 2×. The per-layer variants pay for one extra forward pass per layer.
+- **On the large MLP,** the CPU cost of the O(n·m) algebra dominates for ARCs. For Muon it's the per-step Newton–Schulz products, and for Shampoo the eigendecompositions.
+- **Wall times varied by up to ~1.7× between two benchmark runs on the same machine** (compare the round-4 table). The ratios to SGD stayed within about 15%.
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -278,6 +381,7 @@ for xb, yb in loader:
 - `src/run.py` runs one experiment (`--arch paper|deep`, `--per_layer`, `--mu_per_layer`, `--rho_batch current|next`, `--mu_floor_kappa`, `--hess_beta`, `--history`).
 - `src/grid.py` runs the grids (`--suite main|layer|memory|fix`).
 - `src/analyze.py` and `src/analyze_followup.py` build the tables and figures, and `src/overhead.py` measures the per-epoch cost.
+- `src/baselines.py` has the Muon, Shampoo and SophiaG baselines; `src/sweep_round6.py` runs their learning-rate sweep; `src/analyze_training.py`, `src/analyze_fmnist.py` and `src/analyze_modern.py` build the round-4 to round-6 tables and figures.
 - `src/arcs_optim.py` is the `torch.optim.Optimizer` wrapper, and `src/test_optim.py` checks it against the functional implementation.
 
 ## Reproduce
@@ -297,5 +401,16 @@ python3 -m venv .venv
 ./run_round4.sh
 .venv/bin/python src/overhead.py --threads 8                 # on an idle machine
 .venv/bin/python src/test_optim.py                           # torch.optim wrapper == functional
+.venv/bin/python src/analyze_training.py                     # training response vs. the weight on B_new
+# round 5 (F-MNIST, the paper's CNN)
+.venv/bin/python src/grid.py --suite fmnist --bs 64,256 --workers 14 --threads 1
+.venv/bin/python src/analyze_fmnist.py
+# round 6 (modern baselines: initial lr grid, then adaptive extension + seeds 1,2)
+.venv/bin/python src/grid.py --suite modern_mnist --bs 256 --seeds 0
+.venv/bin/python src/grid.py --suite modern_fmnist --bs 64,256 --seeds 0
+.venv/bin/python src/sweep_round6.py
+.venv/bin/python src/analyze_modern.py
+.venv/bin/python src/test_baselines.py
+.venv/bin/python src/overhead.py --arch cnn --data fmnist --out overhead_cnn.md
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

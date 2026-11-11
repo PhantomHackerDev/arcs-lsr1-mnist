@@ -5,6 +5,7 @@ __pycache__/
 # raw per-run outputs (large); summaries and figures are committed
 results/*.json
 !results/summary.json
+!results/round6_selection.json
 results/logs/
 results_*.log
 # personal files that must never be committed

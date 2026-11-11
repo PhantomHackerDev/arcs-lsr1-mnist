@@ -17,10 +17,16 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run  # noqa: E402
 from arcs_lsr1 import ARCsLSR1  # noqa: E402
+from baselines import FlatMuon, FlatShampoo, FlatSophiaG  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 
 CONFIGS = [
     ("SGD + momentum", "sgd", {}),
     ("Adam", "adam", {}),
+    ("AdamW", "adamw", {}),
+    ("Muon", "muon", {}),
+    ("Shampoo (Adam grafting, preconditioner every 10 steps)", "shampoo", {}),
+    ("SophiaG (Hessian estimate every 10 steps)", "sophia", {}),
     ("ARCs-LSR1, full network, m=10", "arcs", dict(history=10)),
     ("per-layer models, shared μ, m=10", "arcs", dict(history=10, per_layer=True)),
     ("per-layer μ_l + floor, m=10", "arcs", dict(history=10, per_layer=True, mu_per_layer=True, mu_floor_kappa=1.0)),
@@ -53,7 +59,12 @@ def bench(kind, kw, a, Xtr, Ttr):
         opt = ARCsLSR1(run.N_PARAMS, y_mode="same", blocks=run.LAYER_BLOCKS if per_layer else None, **kw)
     else:
         xp = x.clone().requires_grad_(True)
-        topt = torch.optim.SGD([xp], lr=0.1, momentum=0.9) if kind == "sgd" else torch.optim.Adam([xp], lr=1e-3)
+        topt = {"sgd": lambda: torch.optim.SGD([xp], lr=0.1, momentum=0.9),
+                "adam": lambda: torch.optim.Adam([xp], lr=1e-3),
+                "adamw": lambda: torch.optim.AdamW([xp], lr=1e-3),
+                "muon": lambda: FlatMuon(xp, run.SHAPES),
+                "shampoo": lambda: FlatShampoo(xp, run.SHAPES),
+                "sophia": lambda: FlatSophiaG(xp)}[kind]()
     flops0 = 0
     for k, idx in enumerate(idxs):
         if k == a.warmup:  # start measuring
@@ -71,8 +82,19 @@ def bench(kind, kw, a, Xtr, Ttr):
             topt.zero_grad()
             L = run.loss_fn(xp, Xb, Tb)
             L.backward()
+            if kind == "sophia" and topt.wants_hessian():
+                g_keep = xp.grad.clone()
+                logits = run.forward(xp, Xb)
+                ys = torch.distributions.Categorical(logits=logits.detach()).sample()
+                (gs,) = torch.autograd.grad(F.cross_entropy(logits, ys), xp)
+                topt.update_hessian(gs)  # O(n), negligible next to the extra backward
+                xp.grad = g_keep
+                n_grad += 1
             t_model += time.perf_counter() - t0
-            topt.step()
+            if kind == "sophia":
+                topt.step(a.bs)
+            else:
+                topt.step()
             n_grad += 1
     t_total = time.perf_counter() - t_start
     it = a.iters
@@ -87,6 +109,8 @@ def bench(kind, kw, a, Xtr, Ttr):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="deep")
+    ap.add_argument("--data", default="mnist")
+    ap.add_argument("--out", default="overhead.md")
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--iters", type=int, default=150)
     ap.add_argument("--warmup", type=int, default=20)
@@ -94,7 +118,7 @@ def main():
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     run.set_arch(a.arch)
-    Xtr, Ttr, _, _ = run.load_mnist()
+    Xtr, Ttr, _, _ = run.load_data(a.data)
     f_fwd, f_fb = run.model_flops_per_sample()
     it_per_epoch = Xtr.shape[0] // a.bs
     rows = []
@@ -120,7 +144,7 @@ def main():
     lines += ["", f"Model FLOPs per sample (torch FlopCounterMode): forward {f_fwd:.3g}, forward+backward {f_fb:.3g}. "
               "Optimizer FLOPs count only the products with parameter-sized arrays (O(n·m)); O(n) vector "
               "operations are not counted, and for SGD/Adam the optimizer cost is a few O(n) operations per step."]
-    out = os.path.join(run.ROOT, "results", "overhead.md")
+    out = os.path.join(run.ROOT, "results", a.out)
     with open(out, "w") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
