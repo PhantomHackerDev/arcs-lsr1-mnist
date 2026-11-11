@@ -96,6 +96,7 @@ class BlockState:
         self.gV: float = delta
         self.n_skip = 0
         self.n_add = 0
+        self.flops = 0  # dominant optimizer FLOPs (products with n_b-sized arrays)
 
     @property
     def k(self):
@@ -111,6 +112,7 @@ class BlockState:
         self.buf[:, j] = s
         self.buf[:, m + j] = y
         v = self.buf.T @ torch.stack([s, y], 1)  # (2m, 2)
+        self.flops += 2 * self.buf.shape[0] * self.buf.shape[1] * 2
         for col, c in ((j, 0), (m + j, 1)):
             self.G[:, col] = v[:, c]
             self.G[col, :] = v[:, c]
@@ -121,9 +123,11 @@ class BlockState:
 
     # U_par products without forming U_par
     def Ut(self, v):
+        self.flops += 2 * self.buf.shape[0] * self.buf.shape[1]
         return self.Wfull.T @ (self.buf.T @ v)
 
     def U(self, z):
+        self.flops += 2 * self.buf.shape[0] * self.buf.shape[1]
         return self.buf @ (self.Wfull @ z)
 
 
@@ -325,6 +329,7 @@ class ARCsLSR1:
         a = self.hess_beta
         if blk.Wfull is not None:
             U_new = blk.buf @ blk.Wfull
+            blk.flops += 2 * blk.buf.shape[0] * blk.buf.shape[1] * blk.Wfull.shape[1]
             lam_new = blk.lam_hat
         else:
             U_new = torch.zeros(blk.end - blk.start, 0, dtype=DT)
@@ -338,6 +343,7 @@ class ARCsLSR1:
             blk.gV = a * blk.gV + (1 - a) * blk.delta
             return
         G = W.T @ W
+        blk.flops += 2 * W.shape[0] * W.shape[1] ** 2
         e, E = torch.linalg.eigh(0.5 * (G + G.T))
         keep = e > 1e-12 * float(e[-1])
         Z = E[:, keep] / e[keep].sqrt()  # Q = W Z orthonormal
@@ -347,6 +353,7 @@ class ARCsLSR1:
         kap, P = torch.linalg.eigh(0.5 * (K + K.T))
         idx = torch.argsort(kap.abs(), descending=True)[: self.rank_cap]
         blk.V = W @ (Z @ P[:, idx])
+        blk.flops += 2 * W.shape[0] * W.shape[1] * len(idx)
         blk.lamV = kap[idx]
         blk.gV = a * blk.gV + (1 - a) * blk.delta
 
@@ -358,8 +365,13 @@ class ARCsLSR1:
         mu = self.mus[0] if mu is None else mu
         if self.hess_beta > 0 and blk.V is not None:
             has = blk.V.shape[1] > 0
-            Ut = lambda v: blk.V.T @ v  # noqa: E731
-            U = lambda z: blk.V @ z  # noqa: E731
+            def Ut(v):
+                blk.flops += 2 * blk.V.numel()
+                return blk.V.T @ v
+
+            def U(z):
+                blk.flops += 2 * blk.V.numel()
+                return blk.V @ z
             lam_hat, d = blk.lamV, blk.gV
         else:
             has = blk.Wfull is not None
@@ -388,6 +400,24 @@ class ARCsLSR1:
             # s = U sp - alpha (I - U U^T) g  =  -alpha g + U (alpha gp + sp)
             s = s + U(alpha * gp + sp)
         return s, m_par + m_perp, diag
+
+    def _secant_residual(self, blk: BlockState) -> float:
+        """||B s_k - y_k|| / ||y_k|| for the newest stored pair, where B is the
+        model used for the step (L-SR1, or B~ with Hessian momentum)."""
+        if blk.k == 0:
+            return float("nan")
+        s, y = blk.newest()
+        if self.hess_beta > 0 and blk.V is not None:
+            Bs = blk.gV * s + (blk.V @ (blk.lamV * (blk.V.T @ s)) if blk.V.shape[1] else 0.0)
+        elif blk.Wfull is not None:
+            Bs = blk.delta * s + blk.buf @ (blk.Wfull @ (blk.lam_hat * (blk.Wfull.T @ (blk.buf.T @ s))))
+        else:
+            Bs = blk.delta * s
+        return float((Bs - y).norm() / y.norm())
+
+    @property
+    def flops(self) -> int:
+        return sum(b.flops for b in self.blocks)
 
     def _mu_next(self, mu: float, rho: float) -> float:
         if rho > self.eta2:
@@ -450,6 +480,7 @@ class ARCsLSR1:
                 self._momentum(blk)
             sb, mb, dg = self._block_step(blk, g_model[blk.start:blk.end], mu_used[i])
             inf.update(dg)
+            inf["sec_res"] = self._secant_residual(blk)
             infos.append(inf)
             steps.append(sb)
             preds.append(-mb)
@@ -576,7 +607,7 @@ class ARCsLSR1:
             "delta": col("delta"), "lam_min": col("lam_min"), "lam_max": col("lam_max"),
             "n_neg": col("n_neg"), "lam_hat_min": col("lam_hat_min"), "cond_minv": col("cond_minv"),
             "cond_psi": col("cond_psi"), "eig_max_abs": col("eig_max_abs"), "bad": col("bad"),
-            "k_pairs": col("k"),
+            "k_pairs": col("k"), "sec_res": col("sec_res"),
         }
 
     # ------------------------------------------------------------------ diagnostics

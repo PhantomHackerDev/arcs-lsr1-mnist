@@ -29,17 +29,40 @@
 
 ### Q2: history size vs. Hessian momentum (deep net, bs 256, per-layer μ_l, same-batch y)
 
-| history m | Hessian momentum α | rank cap | n-vectors stored per layer | test acc % | train loss | time s |
+B̃ = w_old·B̃ + w_new·B_new. Rounds 2 used w_new = 0.5 / 0.1; round 4 flips it to w_new = 0.7 / 0.9 (Aditya's suggestion) and also tries rank cap m.
+
+| history m | weight on B_new | rank cap | n-vectors stored per layer | test acc % | train loss | time s |
 |---|---|---|---|---|---|---|
-| 1 | – | – | 2 | 98.19 ± 0.09 | 0.003 | 275 |
-| 2 | – | – | 4 | 98.39 ± 0.13 | 0.004 | 499 |
+| 1 | – (plain L-SR1) | – | 2 | 98.19 ± 0.09 | 0.003 | 275 |
+| 1 | 0.9 | 1 | 3 | 98.18 ± 0.16 | 0.006 | 838 |
+| 1 | 0.7 | 1 | 3 | 98.19 ± 0.04 | 0.005 | 850 |
+| 2 | – (plain L-SR1) | – | 4 | 98.39 ± 0.13 | 0.004 | 499 |
+| 1 | 0.9 | 2 | 4 | 98.05 ± 0.04 | 0.005 | 864 |
+| 1 | 0.7 | 2 | 4 | 98.14 ± 0.08 | 0.003 | 908 |
 | 1 | 0.5 | 2 | 4 | 98.11 ± 0.08 | 0.006 | 402 |
-| 1 | 0.9 | 2 | 4 | 98.23 ± 0.13 | 0.005 | 556 |
+| 1 | 0.1 | 2 | 4 | 98.23 ± 0.13 | 0.005 | 556 |
+| 2 | 0.9 | 2 | 6 | 98.35 ± 0.07 | 0.004 | 1222 |
+| 2 | 0.7 | 2 | 6 | 98.32 ± 0.15 | 0.004 | 1224 |
+| 2 | 0.9 | 4 | 8 | 98.34 ± 0.09 | 0.003 | 1288 |
+| 2 | 0.7 | 4 | 8 | 98.38 ± 0.14 | 0.003 | 1282 |
 | 2 | 0.5 | 4 | 8 | 98.31 ± 0.09 | 0.003 | 1066 |
-| 2 | 0.9 | 4 | 8 | 98.25 ± 0.14 | 0.002 | 1313 |
-| 5 | – | – | 10 | 98.43 ± 0.01 | 0.003 | 1253 |
-| 10 | – | – | 20 | 98.35 ± 0.02 | 0.003 | 853 |
+| 2 | 0.1 | 4 | 8 | 98.25 ± 0.14 | 0.002 | 1313 |
+| 5 | – (plain L-SR1) | – | 10 | 98.43 ± 0.01 | 0.003 | 1253 |
+| 10 | – (plain L-SR1) | – | 20 | 98.35 ± 0.02 | 0.003 | 853 |
 | Adam (lr 1e-3) | | | 0–2 | 98.14 ± 0.06 | 0.011 | 116 |
 | SGD+momentum (lr 0.1) | | | 0–2 | 98.05 ± 0.14 | 0.011 | 152 |
 
 Wall-clock times (time s) are not comparable between rows: up to 8 runs shared 16 cores with varying load. Only order-of-magnitude differences (first-order vs. ARCs) are meaningful.
+
+### Secant residual vs. weight on B_new (m = 2, rank cap 4, seed 0, 3 epochs, batch 256)
+
+‖B̃ s_k − y_k‖ / ‖y_k‖ for the newest pair, averaged over layers. With weight w on B_new, B̃ s_k − y_k = (1 − w)(B̃_old s_k − y_k), so the residual should shrink linearly as w → 1.
+
+| weight on B_new | median residual | mean residual | test acc % after 3 epochs |
+|---|---|---|---|
+| 0.1 | 0.607 | 0.61 | 96.59 |
+| 0.3 | 0.44 | 0.444 | 96.32 |
+| 0.5 | 0.304 | 0.306 | 97.60 |
+| 0.7 | 0.184 | 0.184 | 96.84 |
+| 0.9 | 0.0625 | 0.0624 | 96.46 |
+| 1.0 (plain L-SR1) | 3.59e-14 | 4.07e-14 | 96.24 |

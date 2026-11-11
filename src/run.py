@@ -119,6 +119,22 @@ def evaluate(x, X, T, chunk=10000):
     return tot_loss / X.shape[0], correct / X.shape[0]
 
 
+def model_flops_per_sample():
+    """(forward, forward+backward) FLOPs per sample, measured with torch's FlopCounterMode."""
+    from torch.utils.flop_counter import FlopCounterMode
+
+    x = init_params(0).requires_grad_(True)
+    X = torch.zeros(64, 784)
+    T = torch.zeros(64, dtype=torch.long)
+    with FlopCounterMode(display=False) as fc:
+        loss_fn(x.detach(), X, T)
+    f_fwd = fc.get_total_flops() / 64
+    with FlopCounterMode(display=False) as fc:
+        (g,) = torch.autograd.grad(loss_fn(x, X, T), x)
+    f_fb = fc.get_total_flops() / 64
+    return f_fwd, f_fb
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--opt", default="arcs", choices=["arcs", "sgd", "adam"])
@@ -191,12 +207,14 @@ def main():
             topt = torch.optim.Adam([xp], lr=a.lr or 1e-3, eps=1e-6)
 
     log = {"args": vars(a), "name": name, "iters": [], "probes": [], "epochs": []}
+    F_FWD, F_FB = model_flops_per_sample()
+    log["model_flops_per_sample"] = {"forward": F_FWD, "forward_backward": F_FB}
     tl, ta = evaluate(x, Xtr, Ttr)
     vl, va = evaluate(x, Xte, Tte)
     log["epochs"].append({"epoch": 0, "train_loss": tl, "train_acc": ta, "test_loss": vl, "test_acc": va,
                           "time": 0.0, "n_grad": 0, "iter": 0})
     t0 = time.time()
-    n_grad, it = 0, 0
+    n_grad, n_fwd, it = 0, 0, 0
     stop = False
     for ep in range(1, a.epochs + 1):
         perm = torch.randperm(Xtr.shape[0], generator=gen)
@@ -214,6 +232,7 @@ def main():
                     lo_val = make_closures(Xtr[vidx], Ttr[vidx])[1]
                 d = opt.step(x, lg, lo, lo_val)
                 n_grad += d["n_grad"]
+                n_fwd += d.get("n_fwd", 0)
                 d["it"] = it
                 log["iters"].append(d)
                 if a.probe_every and it % a.probe_every == 0 and torch.isfinite(opt._last_s).all():
@@ -237,7 +256,13 @@ def main():
         tl, ta = evaluate(x, Xtr, Ttr)
         vl, va = evaluate(x, Xte, Tte)
         rec = {"epoch": ep, "train_loss": tl, "train_acc": ta, "test_loss": vl, "test_acc": va,
-               "time": time.time() - t0, "n_grad": n_grad, "iter": it, "move_b": layer_move(x)}
+               "time": time.time() - t0, "n_grad": n_grad, "iter": it, "move_b": layer_move(x),
+               # overhead: gradient evaluations (forward+backward), extra forward-only passes,
+               # model FLOPs (measured per sample), optimizer FLOPs (dominant O(n*m) terms;
+               # for SGD/Adam a few O(n) vector ops per step, not counted here)
+               "n_fwd": n_fwd,
+               "model_gflops": (n_grad * F_FB + n_fwd * F_FWD) * a.bs / 1e9,
+               "opt_gflops": (opt.flops / 1e9) if opt is not None else 0.0}
         if opt is not None:
             rec["mu"] = opt.mu
             rec["mu_b"] = list(opt.mus)

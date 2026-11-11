@@ -9,3 +9,4 @@ results/logs/
 results_*.log
 # personal files that must never be committed
 *.pdf
+results/overhead_stdout.txt

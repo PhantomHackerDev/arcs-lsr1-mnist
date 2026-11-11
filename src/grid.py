@@ -60,6 +60,16 @@ FIX = {  # round 3: fixes for the mu_l-per-layer failure with noisy pairs
     "deep_layermu_next_same": LM + "--rho_batch next",
 }
 
+# round 4: Aditya's suggestion to favour B_new (hess_beta = weight on the OLD model)
+FLIP = {}
+for m in (1, 2):
+    for hb in (0.1, 0.3):  # weight on B_new = 0.9, 0.7
+        for cap in (m, 2 * m):
+            FLIP[f"deep_layermu_same_m{m}_hb{hb}_cap{cap}"] = LM + f"--history {m} --hess_beta {hb} --rank_cap {cap}"
+# secant residual vs. weight on the old model (1 seed, short runs; hb 0 = plain L-SR1)
+SECANT = {f"deep_secant_m2_hb{hb}": LM + f"--history 2 --hess_beta {hb} --rank_cap 4" if hb else LM + "--history 2"
+          for hb in (0.0, 0.1, 0.3, 0.5, 0.7, 0.9)}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -69,7 +79,7 @@ def main():
     ap.add_argument("--bs", default="64,256,1024")
     ap.add_argument("--seeds", default="0,1,2")
     ap.add_argument("--only", default="", help="comma list of config names")
-    ap.add_argument("--suite", default="main", choices=["main", "layer", "memory", "fix"])
+    ap.add_argument("--suite", default="main", choices=["main", "layer", "memory", "fix", "flip", "secant"])
     a = ap.parse_args()
     outdir = os.path.join(ROOT, "results")
     logdir = os.path.join(ROOT, "results", "logs")
@@ -82,8 +92,12 @@ def main():
         confs = LAYER
     elif a.suite == "memory":
         confs = MEMORY
-    else:
+    elif a.suite == "fix":
         confs = FIX
+    elif a.suite == "flip":
+        confs = FLIP
+    else:
+        confs = SECANT
     if a.only:
         confs = {k: v for k, v in confs.items() if k in a.only.split(",")}
     for bs, (cname, cargs), seed in itertools.product(

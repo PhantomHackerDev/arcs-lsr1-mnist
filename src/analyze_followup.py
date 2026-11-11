@@ -58,12 +58,14 @@ def load():
 
 
 def memory_of(cfg):
-    """(history m, Hessian-momentum alpha, rank cap, n-vectors stored per layer)."""
+    """(history m, weight on the OLD model (hess_beta), rank cap, n-vectors stored per layer).
+    The weight on B_new is 1 - hess_beta."""
     m = re.search(r"_m(\d+)", cfg)
     m = int(m.group(1)) if m else 10
-    hb = re.search(r"_hb([\d.]+)", cfg)
+    hb = re.search(r"_hb([\d.]+?)(?:_|$)", cfg)
     hb = float(hb.group(1)) if hb else 0.0
-    cap = 2 * m if hb > 0 else 0
+    c = re.search(r"_cap(\d+)", cfg)
+    cap = int(c.group(1)) if c else (2 * m if hb > 0 else 0)
     return m, hb, cap, 2 * m + cap
 
 
@@ -105,7 +107,9 @@ def table(runs):
                 fmt_mu(s.get("mu_b")) if "mu_b" in s else "", f"{s['mu_max']:.2g}" if "mu_max" in s else "",
                 fmt_mu(s.get("move_b")), f"{s['time']:.0f}"]) + " |")
     lines += ["", "### Q2: history size vs. Hessian momentum (deep net, bs 256, per-layer μ_l, same-batch y)", "",
-              "| history m | Hessian momentum α | rank cap | n-vectors stored per layer | test acc % | train loss | time s |",
+              "B̃ = w_old·B̃ + w_new·B_new. Rounds 2 used w_new = 0.5 / 0.1; round 4 flips it to w_new = 0.7 / 0.9 "
+              "(Aditya's suggestion) and also tries rank cap m.", "",
+              "| history m | weight on B_new | rank cap | n-vectors stored per layer | test acc % | train loss | time s |",
               "|---|---|---|---|---|---|---|"]
     mem = sorted({c for (c, bs) in runs if c.startswith("deep_layermu_same") and bs == 256
                   and "floor" not in c and "next" not in c},
@@ -113,7 +117,7 @@ def table(runs):
     for c in mem:
         m, hb, cap, vec = memory_of(c)
         s = stats(runs[(c, 256)])
-        lines.append(f"| {m} | {hb if hb else '–'} | {cap if cap else '–'} | {vec} | "
+        lines.append(f"| {m} | {f'{1 - hb:.1f}' if hb else '– (plain L-SR1)'} | {cap if cap else '–'} | {vec} | "
                      f"{100 * s['acc']:.2f} ± {100 * s['acc_sd']:.2f} | {s['train_loss']:.3f} | {s['time']:.0f} |")
     for b in ("deep_adam", "deep_sgd"):
         if (b, 256) in runs:
@@ -126,6 +130,29 @@ def table(runs):
     with open(os.path.join(RES, "summary_followup.md"), "w") as f:
         f.write(txt)
     return txt
+
+
+def secant_table(runs):
+    """Newest-pair secant residual ||B s_k - y_k|| / ||y_k|| of the model used for the step."""
+    rows = []
+    for (c, bs), logs in runs.items():
+        if not c.startswith("deep_secant_m2_hb") or bs != 256:
+            continue
+        hb = float(c.split("_hb")[1])
+        L = logs[0]
+        res = np.array([np.nanmean(d["sec_res"]) for d in L["iters"] if "sec_res" in d and d["k_pairs"][0] > 0])
+        rows.append((1 - hb, np.nanmedian(res), np.nanmean(res), L["epochs"][-1]["test_acc"]))
+    if not rows:
+        return ""
+    rows.sort()
+    lines = ["", "### Secant residual vs. weight on B_new (m = 2, rank cap 4, seed 0, 3 epochs, batch 256)", "",
+             "‖B̃ s_k − y_k‖ / ‖y_k‖ for the newest pair, averaged over layers. With weight w on B_new, "
+             "B̃ s_k − y_k = (1 − w)(B̃_old s_k − y_k), so the residual should shrink linearly as w → 1.", "",
+             "| weight on B_new | median residual | mean residual | test acc % after 3 epochs |", "|---|---|---|---|"]
+    for w, med, mean, acc in rows:
+        label = "1.0 (plain L-SR1)" if w == 1.0 else f"{w:.1f}"
+        lines.append(f"| {label} | {med:.3g} | {mean:.3g} | {100 * acc:.2f} |")
+    return "\n".join(lines) + "\n"
 
 
 def fig_mu_layers(runs):
@@ -178,7 +205,7 @@ def fig_layer_movement(runs, bs=256):
 
 
 def fig_memory(runs):
-    fig, ax = plt.subplots(figsize=(8, 4.4))
+    fig, ax = plt.subplots(figsize=(8.5, 5.6))
     plain, mom = [], defaultdict(list)
     for (c, bs), logs in runs.items():
         if bs != 256 or not c.startswith("deep_layermu_same") or "floor" in c or "next" in c:
@@ -195,12 +222,13 @@ def fig_memory(runs):
         for v, e, _, m in plain:
             ax.annotate(f"m={int(m)}", (v, e), textcoords="offset points", xytext=(6, 6), fontsize=8.5,
                         color="#52514e")
-    for hb, color, mk in ((0.5, "#eb6834", "s"), (0.9, "#1baf7a", "D")):
+    # weight on B_new = 1 - hess_beta; offsets keep error bars at equal memory apart
+    for hb, color, mk, dodge in ((0.9, "#1baf7a", "D", 0.91), (0.5, "#eb6834", "s", 0.97),
+                                 (0.3, "#e87ba4", "^", 1.03), (0.1, "#6250d6", "v", 1.09)):
         if mom.get(hb):
             a = np.array(sorted(mom[hb]))
-            dodge = 0.95 if hb == 0.5 else 1.05  # same memory: offset so error bars don't overlap
             ax.errorbar(a[:, 0] * dodge, a[:, 1], yerr=a[:, 2], fmt=mk, color=color, capsize=3, ms=7,
-                        label=f"+ Hessian momentum α={hb} (m = 1, 2; rank cap 2m)")
+                        label=f"+ Hessian momentum, weight on B_new = {1 - hb:.1f}")
     for b in ("deep_sgd", "deep_adam"):
         if (b, 256) in runs:
             ax.axhline(100 * (1 - stats(runs[(b, 256)])["acc"]), color=CFG_COLORS[b], ls="--", lw=1.2,
@@ -208,20 +236,24 @@ def fig_memory(runs):
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%g"))
     ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-    ax.set_xticks([2, 4, 8, 10, 20])
+    ax.set_xticks([2, 3, 4, 6, 8, 10, 20])
     ax.set_ylim(1.4, 2.1)
     ax.set_xlabel("n-vectors stored per layer  (2m for pairs, + rank cap for momentum)")
     ax.set_ylabel("test error after 10 epochs (%)")
     ax.set_title("Memory vs. accuracy (deep net, batch 256, per-layer μ_l, mean ± sd)", loc="left")
-    ax.legend(fontsize=8.5, loc="upper right", ncol=1)
-    fig.tight_layout()
+    h, lab = ax.get_legend_handles_labels()
+    fig.legend(h, lab, fontsize=8.5, loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.0))
+    fig.tight_layout(rect=(0, 0.2, 1, 1))
     fig.savefig(os.path.join(FIG, "fig7_memory.png"), dpi=150)
     plt.close(fig)
 
 
 def main():
     runs = load()
-    print(table(runs))
+    txt = table(runs) + secant_table(runs)
+    with open(os.path.join(RES, "summary_followup.md"), "w") as f:
+        f.write(txt)
+    print(txt)
     fig_mu_layers(runs)
     fig_layer_movement(runs)
     fig_memory(runs)

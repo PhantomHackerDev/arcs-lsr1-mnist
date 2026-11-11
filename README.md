@@ -193,6 +193,72 @@ Test accuracy %, mean ± sd:
 - The cause: on an independent mini-batch, f(x) − f(x + s) is dominated by sampling noise, so even good steps often fail. Each failure doubles μ.
 - A larger test batch, or a gentler μ update, might help, but neither has been tested.
 
+## Round 4: Hessian momentum favoring B_new, rank cap, secant residual, overhead
+
+Deep net, batch 256, per-layer μ_l, same-batch pairs, 10 epochs, 3 seeds. B̃ = w_old·B̃ + w_new·B_new. Round 2 used w_new = 0.5 and 0.1. Following Aditya's suggestion, round 4 flips this to w_new = 0.7 and 0.9 and also tries a rank cap of m instead of 2m. Full table: [results/summary_followup.md](results/summary_followup.md), [fig 7](figures/fig7_memory.png).
+
+| history m | weight on B_new | rank cap | n-vectors / layer | test acc % |
+|---|---|---|---|---|
+| 1 | plain L-SR1 | – | 2 | 98.19 ± 0.09 |
+| 1 | 0.9 / 0.7 | 1 | 3 | 98.18 ± 0.16 / 98.19 ± 0.04 |
+| 1 | 0.9 / 0.7 | 2 | 4 | 98.05 ± 0.04 / 98.14 ± 0.08 |
+| **2** | **plain L-SR1** | – | **4** | **98.39 ± 0.13** |
+| 2 | 0.9 / 0.7 | 2 | 6 | 98.35 ± 0.07 / 98.32 ± 0.15 |
+| 2 | 0.9 / 0.7 / 0.5 / 0.1 | 4 | 8 | 98.34 / 98.38 / 98.31 / 98.25 |
+
+**1. Favoring B_new helps slightly, but momentum never beats plain L-SR1.**
+- At m = 2, accuracy rises from 98.25% (w_new = 0.1) to 98.34–98.38% (w_new = 0.7–0.9). The differences are within one sd.
+- No momentum setting beats plain L-SR1 with m = 2, which stores fewer vectors.
+- A rank cap of m is as good as 2m, and slightly better at m = 1.
+
+**2. The secant equation holds only for plain SR1.** With weight w on B_new, B̃s_k − y_k = (1 − w)(B̃_old s_k − y_k), because s_k is a new direction for B̃_old. The measured residual is linear in (1 − w):
+
+| weight on B_new | 0.1 | 0.3 | 0.5 | 0.7 | 0.9 | 1.0 (plain L-SR1) |
+|---|---|---|---|---|---|---|
+| median ‖B̃s_k − y_k‖ / ‖y_k‖ | 0.607 | 0.44 | 0.304 | 0.184 | 0.0625 | 3.6e-14 |
+| residual / (1 − w) | 0.67 | 0.63 | 0.61 | 0.61 | 0.63 | – |
+
+So along each new step, the previous model's prediction is about 62% off, and favoring B_new reduces the error exactly in proportion.
+
+**3. Overhead** ([results/overhead.md](results/overhead.md)). Deep net, batch 256, 8 CPU threads, measured alone on an idle machine:
+
+| optimizer | grad evals / it | extra forwards / it | model GFLOPs / epoch | optimizer GFLOPs / epoch | s / epoch | × SGD |
+|---|---|---|---|---|---|---|
+| SGD + momentum | 1 | 0 | 156 | – | 0.8 | 1.0 |
+| Adam | 1 | 0 | 156 | – | 1.0 | 1.2 |
+| ARCs-LSR1, full network, m = 10 | 2 | 0 | 311 | 31.9 | 11.7 | 14.7 |
+| per-layer μ_l + floor, m = 10 | 2 | 5 | 650 | 31.9 | 13.3 | 16.6 |
+| per-layer μ_l, m = 2 | 2 | 4 | 583 | 6.4 | 7.4 | 9.3 |
+
+- **In FLOPs, ARCs-LSR1 costs about 2.2× SGD per epoch.** That is two gradient evaluations, plus optimizer algebra at about 10% of the model FLOPs. The per-layer μ_l variants cost about 4× because of the extra forward passes.
+- **In wall time it is 9–17× slower** in this implementation. The optimizer step takes 22–46 ms vs 7–11 ms for the model. That time does not scale with FLOPs (m = 2 has 1/5 of the FLOPs of m = 10 but takes half the time), so it is dominated by float64 O(n) vector operations and Python overhead.
+- A float32, fused, or GPU implementation should bring the wall time much closer to the FLOP ratio.
+
+## Using it as a `torch.optim` optimizer
+
+`src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
+
+```python
+from arcs_optim import ARCsLSR1Optim
+
+layers = [m for m in model.modules() if isinstance(m, nn.Linear)]
+opt = ARCsLSR1Optim([{"params": l.parameters()} for l in layers],   # one group = one block
+                    per_layer=True, y_mode="same", mu_per_layer=True, mu_floor_kappa=1.0, history=2)
+
+for xb, yb in loader:
+    def closure(backward=True):          # must evaluate the SAME batch on every call
+        loss = F.cross_entropy(model(xb), yb)
+        if backward:
+            loss.backward()
+        return loss
+    loss = opt.step(closure)
+```
+
+- **Closure:** it may accept `backward`. With `backward=False` it should only compute the loss, so the ratio-test evaluations don't pay for a backward pass. A plain `closure()` also works, at that extra cost.
+- **Gradients:** the optimizer zeros them itself before each evaluation.
+- **Blocks:** each parameter group becomes one block when `per_layer=True`.
+- **Limitation:** `state_dict()` does not include the L-SR1 memory.
+
 ## Implementation notes
 
 - `src/arcs_lsr1.py`: the optimizer. It uses the compact representation
@@ -211,7 +277,8 @@ Test accuracy %, mean ± sd:
   - μ_l per layer, the next-batch ratio and the μ floor converge on a separable toy problem, and the floor holds at every iteration (16 checks in total).
 - `src/run.py` runs one experiment (`--arch paper|deep`, `--per_layer`, `--mu_per_layer`, `--rho_batch current|next`, `--mu_floor_kappa`, `--hess_beta`, `--history`).
 - `src/grid.py` runs the grids (`--suite main|layer|memory|fix`).
-- `src/analyze.py` and `src/analyze_followup.py` build the tables and figures.
+- `src/analyze.py` and `src/analyze_followup.py` build the tables and figures, and `src/overhead.py` measures the per-epoch cost.
+- `src/arcs_optim.py` is the `torch.optim.Optimizer` wrapper, and `src/test_optim.py` checks it against the functional implementation.
 
 ## Reproduce
 
@@ -226,5 +293,9 @@ python3 -m venv .venv
 ./run_followup.sh
 # round 3 (fixes for mu_l per layer)
 .venv/bin/python src/grid.py --suite fix --bs 64,256 --workers 12 --threads 1
+# round 4 (Hessian momentum favoring B_new, rank cap, secant residual)
+./run_round4.sh
+.venv/bin/python src/overhead.py --threads 8                 # on an idle machine
+.venv/bin/python src/test_optim.py                           # torch.optim wrapper == functional
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```
