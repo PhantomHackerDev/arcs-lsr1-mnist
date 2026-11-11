@@ -37,9 +37,14 @@ LABEL = {
     "deep_full_cross": "full network, one μ",
     "deep_layer_cross": "per-layer models, shared μ",
     "deep_layermu_cross": "per-layer models, μ_l per layer",
+    "deep_layermu_floor1_same": "μ_l per layer + floor μ_l ≥ μ_g (round 3)",
+    "deep_layermu_floor1_cross": "μ_l per layer + floor μ_l ≥ μ_g (round 3)",
+    "deep_layermu_next_same": "μ_l per layer, ρ_l on next batch (round 3)",
+    "deep_layermu_next_cross": "μ_l per layer, ρ_l on next batch (round 3)",
 }
 Q1 = ["deep_sgd", "deep_adam", "deep_full_same", "deep_layer_same", "deep_layermu_same",
-      "deep_full_cross", "deep_layer_cross", "deep_layermu_cross"]
+      "deep_layermu_floor1_same", "deep_layermu_next_same", "deep_full_cross", "deep_layer_cross",
+      "deep_layermu_cross", "deep_layermu_floor1_cross", "deep_layermu_next_cross"]
 
 
 def load():
@@ -102,7 +107,8 @@ def table(runs):
     lines += ["", "### Q2: history size vs. Hessian momentum (deep net, bs 256, per-layer μ_l, same-batch y)", "",
               "| history m | Hessian momentum α | rank cap | n-vectors stored per layer | test acc % | train loss | time s |",
               "|---|---|---|---|---|---|---|"]
-    mem = sorted({c for (c, bs) in runs if c.startswith("deep_layermu_same") and bs == 256},
+    mem = sorted({c for (c, bs) in runs if c.startswith("deep_layermu_same") and bs == 256
+                  and "floor" not in c and "next" not in c},
                  key=lambda c: (memory_of(c)[3], memory_of(c)[1]))
     for c in mem:
         m, hb, cap, vec = memory_of(c)
@@ -175,7 +181,7 @@ def fig_memory(runs):
     fig, ax = plt.subplots(figsize=(8, 4.4))
     plain, mom = [], defaultdict(list)
     for (c, bs), logs in runs.items():
-        if bs != 256 or not c.startswith("deep_layermu_same"):
+        if bs != 256 or not c.startswith("deep_layermu_same") or "floor" in c or "next" in c:
             continue
         m, hb, cap, vec = memory_of(c)
         s = stats(logs)

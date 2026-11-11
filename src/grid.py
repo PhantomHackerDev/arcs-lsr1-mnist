@@ -53,6 +53,13 @@ MEMORY = {  # Q2: can Hessian momentum replace history?  (m=10 is deep_layermu_s
     "deep_layermu_same_m2_hb0.9": LM + "--history 2 --hess_beta 0.9 --rank_cap 4",
 }
 
+FIX = {  # round 3: fixes for the mu_l-per-layer failure with noisy pairs
+    "deep_layermu_floor1_cross": LM.replace("--y_mode same", "--y_mode cross") + "--mu_floor_kappa 1",
+    "deep_layermu_floor1_same": LM + "--mu_floor_kappa 1",
+    "deep_layermu_next_cross": LM.replace("--y_mode same", "--y_mode cross") + "--rho_batch next",
+    "deep_layermu_next_same": LM + "--rho_batch next",
+}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -62,7 +69,7 @@ def main():
     ap.add_argument("--bs", default="64,256,1024")
     ap.add_argument("--seeds", default="0,1,2")
     ap.add_argument("--only", default="", help="comma list of config names")
-    ap.add_argument("--suite", default="main", choices=["main", "layer", "memory"])
+    ap.add_argument("--suite", default="main", choices=["main", "layer", "memory", "fix"])
     a = ap.parse_args()
     outdir = os.path.join(ROOT, "results")
     logdir = os.path.join(ROOT, "results", "logs")
@@ -73,8 +80,10 @@ def main():
         confs = {**{k: "--opt arcs " + v for k, v in ARCS.items()}, **BASE}
     elif a.suite == "layer":
         confs = LAYER
-    else:
+    elif a.suite == "memory":
         confs = MEMORY
+    else:
+        confs = FIX
     if a.only:
         confs = {k: v for k, v in confs.items() if k in a.only.split(",")}
     for bs, (cname, cargs), seed in itertools.product(

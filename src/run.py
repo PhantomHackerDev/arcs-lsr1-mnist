@@ -126,6 +126,8 @@ def main():
     ap.add_argument("--mu_per_layer", action="store_true")
     ap.add_argument("--hess_beta", type=float, default=0.0)
     ap.add_argument("--rank_cap", type=int, default=0)
+    ap.add_argument("--rho_batch", default="current", choices=["current", "next"])
+    ap.add_argument("--mu_floor_kappa", type=float, default=0.0)
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
@@ -179,7 +181,8 @@ def main():
             delta_fallback=a.delta_fallback, y_mode=a.y_mode,
             blocks=LAYER_BLOCKS if a.per_layer else None, grad_beta=a.grad_beta,
             stable_cubic=not a.unstable_cubic, mu_per_layer=a.mu_per_layer,
-            hess_beta=a.hess_beta, rank_cap=a.rank_cap)
+            hess_beta=a.hess_beta, rank_cap=a.rank_cap, rho_batch=a.rho_batch,
+            mu_floor_kappa=a.mu_floor_kappa)
     else:
         xp = x.clone().requires_grad_(True)
         if a.opt == "sgd":
@@ -203,7 +206,13 @@ def main():
             it += 1
             if opt is not None:
                 lg, lo = make_closures(Xb, Tb)
-                d = opt.step(x, lg, lo)
+                lo_val = None
+                if a.rho_batch == "next":
+                    # the next mini-batch in this epoch's order (wraps to the first)
+                    nb_ = bi + a.bs if bi + 2 * a.bs <= Xtr.shape[0] else 0
+                    vidx = perm[nb_:nb_ + a.bs]
+                    lo_val = make_closures(Xtr[vidx], Ttr[vidx])[1]
+                d = opt.step(x, lg, lo, lo_val)
                 n_grad += d["n_grad"]
                 d["it"] = it
                 log["iters"].append(d)

@@ -163,6 +163,36 @@ Batch 256, per-layer μ_l, same-batch pairs ([fig 7](figures/fig7_memory.png)):
 
 Wall-clock times in the summary tables are **not** comparable between rows: up to 8 runs shared 16 CPU cores under varying load.
 
+## Round 3: fixing μ_l per layer with noisy pairs (deep net, 10 epochs, 3 seeds)
+
+Round 2 showed that a separate μ_l per layer fails with cross-batch pairs. I tested the two fixes suggested there:
+
+- **ρ_l on the next mini-batch** (`--rho_batch next`): the per-layer and combined ratios are measured on the next batch in the epoch, while y still comes from the current batch.
+- **Floor μ_l ≥ μ_g** (`--mu_floor_kappa 1`): a global μ_g is updated from the ratio of the *full* step, so failing layers count too, and no μ_l may go below μ_g. This costs one extra forward pass.
+  - A first version updated μ_g only from layers that had already passed. It never activated, because a bad layer could not raise μ_g.
+
+Test accuracy %, mean ± sd:
+
+| configuration | cross-batch, bs 64 | cross-batch, bs 256 | same-batch, bs 64 | same-batch, bs 256 |
+|---|---|---|---|---|
+| one μ, full network | 77.56 ± 12.59 | 90.38 ± 1.88 | 98.02 ± 0.08 | 98.31 ± 0.08 |
+| per-layer models, shared μ | 94.11 ± 2.19 | 90.34 ± 11.58 | 98.20 ± 0.25 | 98.34 ± 0.05 |
+| μ_l per layer (round 2) | 41.32 ± 12.16 | 58.22 ± 9.90 | 97.88 ± 0.14 | 98.35 ± 0.02 |
+| **μ_l per layer + floor μ_l ≥ μ_g** | **94.08 ± 0.88** | 89.50 ± 2.85 | 98.15 ± 0.16 | 98.29 ± 0.05 |
+| μ_l per layer, ρ_l on next batch | 81.52 ± 2.72 | 89.19 ± 1.51 | 76.82 ± 1.76 | 84.93 ± 0.81 |
+
+**1. The floor makes μ_l per layer safe.**
+- With cross-batch pairs at batch 64, accuracy goes from 41% to 94%. Layer 1 moves 2.3× its initial norm instead of 64×.
+- With same-batch pairs it matches the other variants. At batch 64 it also removes the late μ saturation: no iteration had a μ_l at the cap, vs 30% of iterations without the floor.
+- It does not beat per-layer models with one shared μ, though it has a smaller seed-to-seed spread at batch 64 (sd 0.88 vs 2.19).
+- So the extra layer-specific damping works as a safeguard, but on MNIST it doesn't improve accuracy.
+
+**2. Measuring ρ_l on the next batch fails** (negative result).
+- It prevents the layer-1 blow-up, but some μ_l sits at the 1e12 cap in 96–99% of iterations, so training mostly freezes.
+- This happens even with good same-batch pairs (77% at batch 64, 85% at batch 256).
+- The cause: on an independent mini-batch, f(x) − f(x + s) is dominated by sampling noise, so even good steps often fail. Each failure doubles μ.
+- A larger test batch, or a gentler μ update, might help, but neither has been tested.
+
 ## Implementation notes
 
 - `src/arcs_lsr1.py`: the optimizer. It uses the compact representation
@@ -178,9 +208,9 @@ Wall-clock times in the summary tables are **not** comparable between rows: up t
   - The secant equations hold.
   - The step is the global minimizer of the shape-changing-norm cubic model.
   - Hessian momentum matches the exact matrix EMA, and its basis stays orthonormal.
-  - μ_l per layer converges on a separable toy problem (14 checks in total).
-- `src/run.py` runs one experiment (`--arch paper|deep`, `--per_layer`, `--mu_per_layer`, `--hess_beta`, `--history`).
-- `src/grid.py` runs the grids (`--suite main|layer|memory`).
+  - μ_l per layer, the next-batch ratio and the μ floor converge on a separable toy problem, and the floor holds at every iteration (16 checks in total).
+- `src/run.py` runs one experiment (`--arch paper|deep`, `--per_layer`, `--mu_per_layer`, `--rho_batch current|next`, `--mu_floor_kappa`, `--hess_beta`, `--history`).
+- `src/grid.py` runs the grids (`--suite main|layer|memory|fix`).
 - `src/analyze.py` and `src/analyze_followup.py` build the tables and figures.
 
 ## Reproduce
@@ -188,11 +218,13 @@ Wall-clock times in the summary tables are **not** comparable between rows: up t
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 14 sanity checks
+.venv/bin/python src/test_math.py                       # 16 sanity checks
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
 # round 2 (deep net: per-layer mu_l, memory / Hessian momentum)
 ./run_followup.sh
+# round 3 (fixes for mu_l per layer)
+.venv/bin/python src/grid.py --suite fix --bs 64,256 --workers 12 --threads 1
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

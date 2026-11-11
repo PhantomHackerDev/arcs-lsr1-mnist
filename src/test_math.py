@@ -176,5 +176,18 @@ f_end = lo(xs)
 check("per-layer mu: objective decreases on toy quadratic", f_end < 1e-3 * f_start,
       f"({f_start:.3e} -> {f_end:.3e}, mus={[f'{v:.2g}' for v in optl.mus]})")
 
+# 8. next-batch ratio test and mu_l floor run and keep their invariants ----------
+xs2 = torch.randn(nA + nB)
+optn = ARCsLSR1(nA + nB, history=4, y_mode="same", blocks=[(0, nA), (nA, nA + nB)], mu_per_layer=True,
+                rho_batch="next", mu_floor_kappa=10.0)
+f_start = lo(xs2)
+floor_ok = True
+for _ in range(40):
+    d = optn.step(xs2, lg, lo, lo)  # deterministic toy: the "next batch" is the same function
+    floor_ok &= all(m_ >= optn.mu_g / 10.0 - 1e-12 for m_ in optn.mus)
+check("next-batch ratio + mu floor: objective decreases", lo(xs2) < 1e-3 * f_start,
+      f"({f_start:.3e} -> {lo(xs2):.3e})")
+check("mu_l >= mu_g / kappa holds every iteration", floor_ok)
+
 print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

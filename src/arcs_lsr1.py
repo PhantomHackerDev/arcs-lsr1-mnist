@@ -153,11 +153,20 @@ class ARCsLSR1:
         mu_per_layer: bool = False,
         hess_beta: float = 0.0,
         rank_cap: int = 0,
+        rho_batch: str = "current",
+        mu_floor_kappa: float = 0.0,
     ):
         """mu_per_layer: one mu_l per block, each adapted by its own ratio
                          rho_l = (f(x) - f(x + s_l)) / pred_l, where x + s_l moves
                          only block l (one extra forward pass per block, no
                          Jacobians). Only blocks with rho_l >= eta1 move.
+           rho_batch:    'current' measures the per-layer and combined ratios on the
+                         batch that produced the step; 'next' measures them on an
+                         independent batch (loss_only_val), so a step that only
+                         fits the current batch cannot pass. Curvature pairs still
+                         come from the current batch.
+           mu_floor_kappa: if > 0, also track a global mu_g (updated by the
+                         combined ratio) and keep every mu_l >= mu_g / kappa.
            hess_beta:    alpha in  B~_{t+1} = alpha B~_t + (1 - alpha) B_new,
                          where B_new is the L-SR1 matrix from the current pairs.
                          B~ is kept as gamma~ I + V Lambda V^T and truncated to
@@ -184,6 +193,9 @@ class ARCsLSR1:
             blocks = [(0, n_params)]
         self.blocks = [BlockState(a, b, history, delta_fallback) for a, b in blocks]
         self.mus = [mu0] * len(self.blocks)  # mus[0] is the shared mu when not per-layer
+        self.rho_batch = rho_batch
+        self.mu_floor_kappa = mu_floor_kappa
+        self.mu_g = mu0  # global mu used only for the mu_l floor
         self._prev_g = None
         self._prev_s = None
         self._prev_accepted = False
@@ -401,12 +413,13 @@ class ARCsLSR1:
                 continue
             self._add_pair(blk, sb, y[blk.start:blk.end])
 
-    def step(self, x: torch.Tensor, loss_and_grad, loss_only) -> dict:
+    def step(self, x: torch.Tensor, loss_and_grad, loss_only, loss_only_val=None) -> dict:
         """One ARCs-LSR1 iteration on one mini-batch.
 
         x                flat float32 parameters (updated in place)
         loss_and_grad(x) -> (float loss, float32 grad) on the CURRENT batch
         loss_only(x)     -> float loss on the CURRENT batch
+        loss_only_val(x) -> float loss on an independent batch (rho_batch='next')
         """
         self.k += 1
         f0, g32 = loss_and_grad(x)
@@ -446,7 +459,14 @@ class ARCsLSR1:
         rho_b = [float("nan")] * nb
         g1_32 = None
         if per_layer_mu:
-            # Aditya's suggestion: per-layer ratio from f with only layer l moved
+            # Aditya's suggestion: per-layer ratio from f with only layer l moved.
+            # f_test is the batch the ratios are measured on (current or next).
+            use_val = self.rho_batch == "next" and loss_only_val is not None
+            f_test = loss_only_val if use_val else loss_only
+            f0_t = f0
+            if use_val:
+                f0_t = loss_only_val(x)
+                n_fwd += 1
             f_b = [float("inf")] * nb
             for i, blk in enumerate(self.blocks):
                 if not finite_step or preds[i] <= 0:
@@ -454,8 +474,8 @@ class ARCsLSR1:
                     continue
                 xl = x.clone()
                 xl[blk.start:blk.end] += steps[i].to(x.dtype)
-                f_b[i] = loss_only(xl)
-                rho_b[i] = (f0 - f_b[i]) / preds[i]
+                f_b[i] = f_test(xl)
+                rho_b[i] = (f0_t - f_b[i]) / preds[i]
                 n_fwd += 1
             A = [i for i in range(nb) if rho_b[i] >= self.eta1]
 
@@ -471,13 +491,16 @@ class ARCsLSR1:
             if A:
                 x_trial = x + s_take.to(x.dtype)
                 if self.y_mode == "same":
-                    f1, g1_32 = loss_and_grad(x_trial)
+                    f1, g1_32 = loss_and_grad(x_trial)  # y on the current batch
                     n_grad += 1
-                else:
+                if use_val:
+                    f1 = loss_only_val(x_trial)
+                    n_fwd += 1
+                elif self.y_mode != "same":
                     f1 = loss_only(x_trial)
                     n_fwd += 1
                 pred = sum(preds[i] for i in A)
-                rho_comb = (f0 - f1) / pred if (math.isfinite(f1) and pred > 0) else -float("inf")
+                rho_comb = (f0_t - f1) / pred if (math.isfinite(f1) and pred > 0) else -float("inf")
             else:
                 pred = sum(preds)
             rho = rho_comb
@@ -488,7 +511,7 @@ class ARCsLSR1:
                 # the block-diagonal model ignores cross-layer curvature, so the
                 # combined step can fail although each layer passed on its own:
                 # fall back to the single best layer (its f is already known)
-                ib = max(A, key=lambda i: f0 - f_b[i])
+                ib = max(A, key=lambda i: f0_t - f_b[i])
                 s_take = masked([ib])
                 x_trial = x + s_take.to(x.dtype)
                 pred, rho, accepted = preds[ib], rho_b[ib], True
@@ -497,6 +520,18 @@ class ARCsLSR1:
                 # layers that moved together share the outcome of the combined step
                 r_i = min(rho_b[i], rho_comb) if i in A else rho_b[i]
                 self.mus[i] = self._mu_next(self.mus[i], r_i)
+            if self.mu_floor_kappa > 0:
+                # global mu from the ratio of the FULL step (all layers, including the
+                # ones that failed on their own), as in the shared-mu variant: a bad
+                # layer raises mu_g and, through the floor, damps every layer.
+                rho_full = -float("inf")
+                if finite_step and sum(preds) > 0:
+                    f_full = f_test(x + s_full.to(x.dtype))
+                    n_fwd += 1
+                    rho_full = (f0_t - f_full) / sum(preds)
+                self.mu_g = self._mu_next(self.mu_g, rho_full)
+                floor = self.mu_g / self.mu_floor_kappa
+                self.mus = [max(m_, floor) for m_ in self.mus]
         else:
             s_take = s_full
             pred = sum(preds)
@@ -537,7 +572,7 @@ class ARCsLSR1:
             "s_norm": float(s_take.norm()) if finite_step else float("nan"),
             "s_norm_b": [float(s.norm()) if finite_step else float("nan") for s in steps],
             "g_norm": float(g.norm()), "pred": pred, "n_grad": n_grad, "n_fwd": n_fwd,
-            "fallback": self._fallback,
+            "fallback": self._fallback, "mu_g": self.mu_g,
             "delta": col("delta"), "lam_min": col("lam_min"), "lam_max": col("lam_max"),
             "n_neg": col("n_neg"), "lam_hat_min": col("lam_hat_min"), "cond_minv": col("cond_minv"),
             "cond_psi": col("cond_psi"), "eig_max_abs": col("eig_max_abs"), "bad": col("bad"),
