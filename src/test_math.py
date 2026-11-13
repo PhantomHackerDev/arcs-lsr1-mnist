@@ -189,5 +189,43 @@ check("next-batch ratio + mu floor: objective decreases", lo(xs2) < 1e-3 * f_sta
       f"({f_start:.3e} -> {lo(xs2):.3e})")
 check("mu_l >= mu_g / kappa holds every iteration", floor_ok)
 
+# 9. large ratio batch / curvature pairs on it ----------------------------------
+# (a) if the "large" batch is the same function as the current batch, the trajectory
+#     must be bitwise identical to the default, on the full and per-layer paths
+for kw in ({}, {"blocks": [(0, nA), (nA, nA + nB)], "mu_per_layer": True, "mu_floor_kappa": 10.0}):
+    for yb in ("current", "rho"):
+        x_ref = torch.randn(nA + nB)
+        x_new = x_ref.clone()
+        o_ref = ARCsLSR1(nA + nB, history=4, y_mode="same", **kw)
+        o_new = ARCsLSR1(nA + nB, history=4, y_mode="same", rho_batch="large", y_batch=yb, **kw)
+        same = True
+        for _ in range(30):
+            d1 = o_ref.step(x_ref, lg, lo)
+            d2 = o_new.step(x_new, lg, lo, lo, lg)
+            same &= bool(torch.equal(x_ref, x_new)) and d1["rho"] == d2["rho"] and d1["mu_b"] == d2["mu_b"]
+        check(f"ratio batch == current batch reproduces the default ({'per-layer' if kw else 'full'}, "
+              f"y_batch={yb})", same)
+
+
+# (b) with a different ratio function: the ratio uses it, and y_batch='rho' builds y from it
+def make_q(D):
+    return (lambda xv: (float(0.5 * (D * xv.to(DT) ** 2).sum()), (D * xv.to(DT)).float()),
+            lambda xv: float(0.5 * (D * xv.to(DT) ** 2).sum()))
+
+
+Dr = Dall * 1.5
+lg_r, lo_r = make_q(Dr)
+xq = torch.randn(nA + nB)
+oq = ARCsLSR1(nA + nB, history=4, y_mode="same", rho_batch="large", y_batch="rho")
+x_before = xq.clone()
+d = oq.step(xq, lg, lo, lo_r, lg_r)
+S_, Y_ = oq.blocks[0].newest()  # the trial step s and its curvature pair
+rho_expect = (lo_r(x_before) - lo_r(x_before + S_.float())) / d["pred"]
+check("large ratio batch: rho is measured on the ratio function", abs(d["rho"] - rho_expect) < 1e-9 * abs(rho_expect),
+      f"(rho {d['rho']:.6f} vs {rho_expect:.6f}; on the current batch it would be "
+      f"{(lo(x_before) - lo(x_before + S_.float())) / d['pred']:.6f})")
+check("y_batch='rho': stored y = g_R(x+s) - g_R(x)", torch.allclose(Y_, Dr * S_, rtol=1e-5, atol=1e-6),
+      f"(max err {float((Y_ - Dr * S_).abs().max()):.1e})")
+
 print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

@@ -132,8 +132,17 @@ def loss_fn(x, X, T):
     return F.cross_entropy(forward(x, X), T)
 
 
+# samples pushed through forward+backward ("fb") and forward only ("f"); the
+# model-FLOP count uses these, so passes on batches of different sizes are
+# charged at their true cost
+SAMPLES = {"fb": 0, "f": 0}
+
+
 def make_closures(Xb, Tb):
+    n = Xb.shape[0]
+
     def loss_and_grad(x):
+        SAMPLES["fb"] += n
         xv = x.detach().requires_grad_(True)
         L = loss_fn(xv, Xb, Tb)
         (g,) = torch.autograd.grad(L, xv)
@@ -141,6 +150,7 @@ def make_closures(Xb, Tb):
 
     @torch.no_grad()
     def loss_only(x):
+        SAMPLES["f"] += n
         return float(loss_fn(x, Xb, Tb))
 
     return loss_and_grad, loss_only
@@ -181,7 +191,17 @@ def main():
     ap.add_argument("--mu_per_layer", action="store_true")
     ap.add_argument("--hess_beta", type=float, default=0.0)
     ap.add_argument("--rank_cap", type=int, default=0)
-    ap.add_argument("--rho_batch", default="current", choices=["current", "next"])
+    ap.add_argument("--rho_batch", default="current", choices=["current", "next", "large"])
+    ap.add_argument("--rho_bs", type=int, default=0,
+                    help="ratio-test batch size: the current batch plus rho_bs - bs other random "
+                         "training samples (sets --rho_batch large)")
+    ap.add_argument("--y_on_rho", action="store_true",
+                    help="same-batch curvature pairs on the ratio batch instead of the current batch")
+    ap.add_argument("--no_pairs", action="store_true",
+                    help="ablation: no curvature pairs, B = delta_fallback * I (cubic-regularized gradient step)")
+    ap.add_argument("--eta1", type=float, default=0.1)
+    ap.add_argument("--eta2", type=float, default=0.75)
+    ap.add_argument("--mu_min", type=float, default=1e-8)
     ap.add_argument("--mu_floor_kappa", type=float, default=0.0)
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=10)
@@ -202,6 +222,10 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--outdir", default=os.path.join(ROOT, "results"))
     a = ap.parse_args()
+    if a.rho_bs:
+        assert a.rho_bs > a.bs, "--rho_bs must exceed --bs"
+        a.rho_batch = "large"
+    assert not a.y_on_rho or (a.rho_bs and a.y_mode == "same"), "--y_on_rho needs --rho_bs and --y_mode same"
 
     torch.set_num_threads(a.threads)
     set_arch(a.arch)
@@ -237,7 +261,9 @@ def main():
             blocks=LAYER_BLOCKS if a.per_layer else None, grad_beta=a.grad_beta,
             stable_cubic=not a.unstable_cubic, mu_per_layer=a.mu_per_layer,
             hess_beta=a.hess_beta, rank_cap=a.rank_cap, rho_batch=a.rho_batch,
-            mu_floor_kappa=a.mu_floor_kappa)
+            mu_floor_kappa=a.mu_floor_kappa, eta1=a.eta1, eta2=a.eta2, mu_min=a.mu_min,
+            y_batch="rho" if a.y_on_rho else "current", use_pairs=not a.no_pairs)
+        gen_rho = torch.Generator().manual_seed(2000 + a.seed)
     else:
         xp = x.clone().requires_grad_(True)
         if a.opt == "sgd":
@@ -271,13 +297,19 @@ def main():
             it += 1
             if opt is not None:
                 lg, lo = make_closures(Xb, Tb)
-                lo_val = None
+                lo_val = lg_val = None
                 if a.rho_batch == "next":
                     # the next mini-batch in this epoch's order (wraps to the first)
                     nb_ = bi + a.bs if bi + 2 * a.bs <= Xtr.shape[0] else 0
                     vidx = perm[nb_:nb_ + a.bs]
                     lo_val = make_closures(Xtr[vidx], Ttr[vidx])[1]
-                d = opt.step(x, lg, lo, lo_val)
+                elif a.rho_batch == "large":
+                    # the current batch plus rho_bs - bs random samples from outside it
+                    j = torch.randperm(Xtr.shape[0] - a.bs, generator=gen_rho)[: a.rho_bs - a.bs]
+                    j = torch.where(j >= bi, j + a.bs, j)
+                    vidx = torch.cat([idx, perm[j]])
+                    lg_val, lo_val = make_closures(Xtr[vidx], Ttr[vidx])
+                d = opt.step(x, lg, lo, lo_val, lg_val)
                 n_grad += d["n_grad"]
                 n_fwd += d.get("n_fwd", 0)
                 d["it"] = it
@@ -301,10 +333,12 @@ def main():
                         topt.update_hessian(gs)
                         xp.grad = g_keep
                         n_grad += 1
+                        SAMPLES["fb"] += a.bs
                     topt.step(a.bs)
                 else:
                     topt.step()
                 n_grad += 1
+                SAMPLES["fb"] += a.bs
                 if it % 10 == 0:
                     # per-batch improvement f_B(x_k) - f_B(x_k+1), comparable with the ARCs logs
                     # (diagnostic forward pass, not counted in the overhead numbers)
@@ -324,7 +358,10 @@ def main():
                # model FLOPs (measured per sample), optimizer FLOPs (dominant O(n*m) terms;
                # for SGD/Adam a few O(n) vector ops per step, not counted here)
                "n_fwd": n_fwd,
-               "model_gflops": (n_grad * F_FB + n_fwd * F_FWD) * a.bs / 1e9,
+               "model_gflops": (SAMPLES["fb"] * F_FB + SAMPLES["f"] * F_FWD) / 1e9,
+               # model compute in units of full-training-set gradient evaluations
+               "grad_epochs": (SAMPLES["fb"] * F_FB + SAMPLES["f"] * F_FWD) / (F_FB * Xtr.shape[0]),
+               "samples_fb": SAMPLES["fb"], "samples_f": SAMPLES["f"],
                "opt_gflops": (opt.flops / 1e9) if opt is not None else 0.0}
         if opt is not None:
             rec["mu"] = opt.mu

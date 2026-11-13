@@ -337,6 +337,90 @@ Full tables: [results/summary_modern.md](results/summary_modern.md), [fig 10](fi
 - **On the large MLP,** the CPU cost of the O(n·m) algebra dominates for ARCs. For Muon it's the per-step Newton–Schulz products, and for Shampoo the eigendecompositions.
 - **Wall times varied by up to ~1.7× between two benchmark runs on the same machine** (compare the round-4 table). The ratios to SGD stayed within about 15%.
 
+## Round 7: fixing the per-batch overfitting (F-MNIST CNN, batch 64)
+
+Setting: full-network ARCs-LSR1, same-batch y, m = 10. This is where round 5 had the largest gap. Three ideas were screened on seed 0, and the selected configurations got seeds 1 and 2. As with the baselines' learning rates, selection is by the final **training** loss.
+- **R:** ratio test on a larger batch, made of the current 64 samples plus random other samples (256 or 1024 in total). The gradient in the model is still the current batch's.
+- **Y:** curvature pairs on that larger batch as well, y = g_R(x + s) − g_R(x).
+- **H:** the ARCs hyperparameters, one at a time from the defaults: η₁, η₂, μ₀, the floor μ_min, and the γ rule.
+
+Full table, including every screened configuration: [results/summary_round7.md](results/summary_round7.md), [fig 11](figures/fig11_round7.png). Model compute is counted per sample, so passes on the larger batch are charged at their size (1.0 = one full-training-set gradient).
+
+| method (3 seeds) | final training loss | test acc % | compute / epoch |
+|---|---|---|---|
+| ARCs-LSR1, defaults (round 5) | 0.713 ± 0.050 | 73.40 ± 1.62 | 2.0 |
+| ratio test on 256 samples, (η₁, η₂) = (0.01, 0.25) | 0.366 ± 0.020 | 84.98 ± 0.65 | 5.0 |
+| pairs + ratio test on 256 samples, (η₁, η₂) = (0.01, 0.25) | 0.371 ± 0.018 | 84.91 ± 0.25 | 9.0 |
+| floor μ_min = 16 | 0.220 ± 0.010 | 88.72 ± 0.30 | 2.0 |
+| floor μ_min = 16, **no curvature pairs (B = I)** | 0.213 ± 0.015 | 89.00 ± 0.42 | 2.0 |
+| **floor μ_min = 64** (selected) | **0.203 ± 0.012** | **89.54 ± 0.29** | 2.0 |
+| floor μ_min = 64, **no curvature pairs (B = I)** | 0.211 ± 0.007 | 89.34 ± 0.21 | 2.0 |
+| Adam (paper) | 0.205 ± 0.013 | 90.03 ± 0.29 | 1.0 |
+| AdamW (tuned lr) | 0.198 ± 0.009 | 89.55 ± 0.23 | 1.0 |
+| Muon (tuned lr) | 0.128 ± 0.001 | 90.25 ± 0.14 | 1.0 |
+
+**1. The ARC μ update cannot work with a ratio measured off the batch.**
+- μ halves only when ρ > η₂ = 0.75, and it doubles whenever ρ < η₁.
+- Measured on a larger batch, ρ has a median of 0.2–0.37 and exceeds 0.75 in only 0–3% of steps. So μ only goes up. It reaches the cap (10¹²) and training stops: the final training loss is 0.73 with 256 samples and 0.92 with 1024.
+- Even for tiny steps, ρ ≈ g_Rᵀg_B / ‖g_B‖². That value is limited by the gradient's signal-to-noise ratio, however small the step.
+- Lowering (η₁, η₂) to (0.01, 0.25) lets μ settle, and the loss drops from 0.71 to 0.37 with 256 samples, at 2.5× the compute. With 1024 samples μ still blows up unless η goes lower still: (0, 0.1) gives 0.47.
+
+**2. Lowering η on the current batch makes things worse** (seed 0).
+- (η₁, η₂) = (0.01, 0.25) and (0, 0.1) diverge: the loss goes back to 2.3, which is the chance level.
+- Accepting more steps that fit the current batch makes the overfitting worse. Raising η₁ helps instead: 0.29 at η₁ = 0.5.
+- μ₀ hardly matters (0.63–0.77, within seed noise).
+
+**3. The floor μ_min is the hyperparameter that matters.**
+- It bounds the step: with μ ≥ μ_min, ‖s‖ ≲ √(‖g‖/μ_min).
+- The seed-0 sweep over μ_min = 1, 4, 16, 64, 256 gives training losses of 0.40, 0.26, 0.22, 0.20, 0.23. The best value, 64, is inside the range.
+- With a floor, μ sits at μ_min in 99.9% of the steps and 99.9% of the steps are accepted. So the ratio test and the μ adaptation no longer do anything, and the method acts like a fixed step-size method.
+- The floor plays the role of the baselines' learning rate, so tuning it is the fair comparison. With it, ARCs matches Adam per epoch (0.203 vs. 0.205) at twice the compute per epoch, because it takes two gradients per step. It still trails Muon (0.128).
+
+**4. Without curvature pairs (B = I), the result is the same within seed noise:** 0.211 vs. 0.203 at μ_min = 64, and 0.213 vs. 0.220 at μ_min = 16.
+- At μ_min = 64, the cubic term μ‖s‖ ≈ 8.1, while B has δ ≈ 1.6 and λ_max ≈ 18.
+- The curvature changes the step only inside the 2m = 20-dimensional span of the pairs. The rest of the 21,840-dimensional step is scaled by 1/(δ + μ‖s‖), just as it would be with B = I.
+- So on this problem the improvement comes from bounding the step, not from the L-SR1 curvature.
+
+**5. Combinations add nothing** (seed 0): μ_min = 16 together with η₁ = 0.5, or with the ratio test on 256 samples, or with pairs + ratio test on 256 samples, gives 0.208–0.227.
+
+## Round 8: does the L-SR1 curvature help when the gradient is less noisy?
+
+Same method as round 7 (full network, same-batch y, m = 10), with and without curvature pairs, over the floor μ_min.
+- Settings: F-MNIST CNN at batch 64, 256 and 1024, and the MNIST deep MLP at batch 256.
+- Without pairs, B = I, so the step is a cubic-regularized gradient step.
+- For each column, μ_min was chosen by the seed-0 training loss, and seeds 1 and 2 were then run at that value.
+
+Full tables: [results/summary_round8.md](results/summary_round8.md), [fig 12](figures/fig12_curvature_value.png).
+
+The last epoch alone is a noisy measure. On MNIST, the late-training loss jumps by up to 5× between consecutive epochs. So the table also gives the geometric mean of the training loss over epochs 1–10, and the ratio between the two curves at each epoch.
+
+| setting (3 seeds) | μ_min: pairs / no pairs | final train loss: pairs / no pairs | test acc %: pairs / no pairs | geometric mean over epochs: pairs / no pairs | pairs ÷ no pairs, at each epoch |
+|---|---|---|---|---|---|
+| F-MNIST, batch 64 | 64 / 16 | 0.203 ± 0.012 / 0.213 ± 0.015 | 89.54 / 89.00 | 0.259 / 0.261 | 0.95–1.04 |
+| F-MNIST, batch 256 | 4 / 4 | **0.227 ± 0.003** / 0.333 ± 0.031 | **89.09** / 85.93 | **0.284** / 0.433 | **0.61–0.70** |
+| F-MNIST, batch 1024 | 4 / 1 | **0.296 ± 0.009** / 0.608 ± 0.056 | **88.21** / 76.49 | **0.396** / 0.686 | **0.49–0.72** |
+| MNIST deep MLP, batch 256 | 4 / 1 | 0.0068 ± 0.0079 / 0.0068 ± 0.0032 | 98.22 / 98.19 | **0.0210** / 0.0353 | **0.48–0.69** |
+
+**1. The L-SR1 curvature helps once the gradient is less noisy.**
+- At batch 256 and 1024 on F-MNIST, and at batch 256 on MNIST, the pairs lower the training loss by roughly 30–50% at every epoch.
+- At batch 64 they make no difference (round 7).
+- This fits the round-7 picture: the curvature acts only in the 2m directions spanned by the pairs, and those pairs are only useful when they are not dominated by gradient noise.
+
+**2. On MNIST the final epoch hides this.**
+- At μ_min = 4, one seed jumped from 0.0056 to 0.0159 in the last epoch, so the final values overlap.
+- The curves themselves are separated at every epoch (fig 12, bottom right).
+
+**3. The floor helps at every batch size, and the best floor gets smaller as the batch grows:** 64 at batch 64, and 4 at batch 256 and 1024.
+- On F-MNIST at batch 256, μ_min = 4 lowers the training loss from 0.459 (defaults) to 0.227.
+- At the larger batches the adaptive part of ARC acts again. μ rises above the floor in 2% of the steps at batch 256, 38% at batch 1024, and 45% on MNIST. At batch 1024, 15% of the steps are rejected.
+- At batch 64, μ never leaves the floor.
+
+**4. Against the baselines (10 epochs, per epoch):**
+- On F-MNIST at batch 256, tuned ARCs-LSR1 (0.227, 89.09%) beats the paper's SGD (0.259) and Adam (0.269).
+- It still trails the tuned AdamW (0.210), SophiaG (0.196), Shampoo (0.146) and Muon (0.139), and it costs twice as much per epoch.
+- On MNIST, Muon (0.00014) and Shampoo (0.0005) remain well ahead.
+- I have not tuned the baselines at batch 1024.
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -389,7 +473,7 @@ for xb, yb in loader:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 16 sanity checks
+.venv/bin/python src/test_math.py                       # 22 sanity checks
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
@@ -412,5 +496,18 @@ python3 -m venv .venv
 .venv/bin/python src/analyze_modern.py
 .venv/bin/python src/test_baselines.py
 .venv/bin/python src/overhead.py --arch cnn --data fmnist --out overhead_cnn.md
+# round 7 (F-MNIST batch 64: larger ratio/curvature batch, ARCs hyperparameters, no-pairs ablation)
+.venv/bin/python src/grid.py --suite round7 --bs 64 --seeds 0 --workers 12 --threads 1
+.venv/bin/python src/grid.py --suite round7 --bs 64 --seeds 1,2 --workers 12 --threads 1 \
+    --only r7_mumin_64,r7_mumin_16,r7_nopairs_mumin_16,r7_nopairs_mumin_64,r7_rho256_eta0.01-0.25,r7_yrho256_eta0.01-0.25
+.venv/bin/python src/analyze_round7.py
+# round 8 (value of the L-SR1 curvature vs. batch size: mu_min sweep with / without pairs)
+.venv/bin/python src/grid.py --suite round8_fm --bs 256,1024 --seeds 0 --workers 6 --threads 1
+.venv/bin/python src/grid.py --suite round8_deep --bs 256 --seeds 0 --workers 6 --threads 1
+.venv/bin/python src/grid.py --suite round8_fm --bs 64 --seeds 0 --only r8_fm_nopairs_mumin0,r8_fm_nopairs_mumin1,r8_fm_nopairs_mumin256
+.venv/bin/python src/grid.py --suite fmnist --only fm_full_same --bs 1024 --seeds 0
+.venv/bin/python src/grid.py --suite round8_fm --bs 256,1024 --seeds 1,2 --only r8_fm_pairs_mumin4,r8_fm_nopairs_mumin4,r8_fm_nopairs_mumin1
+.venv/bin/python src/grid.py --suite round8_deep --bs 256 --seeds 1,2 --only r8_deep_pairs_mumin4,r8_deep_nopairs_mumin1
+.venv/bin/python src/analyze_round8.py
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

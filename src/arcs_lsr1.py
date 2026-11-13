@@ -159,16 +159,26 @@ class ARCsLSR1:
         rank_cap: int = 0,
         rho_batch: str = "current",
         mu_floor_kappa: float = 0.0,
+        y_batch: str = "current",
+        use_pairs: bool = True,
     ):
         """mu_per_layer: one mu_l per block, each adapted by its own ratio
                          rho_l = (f(x) - f(x + s_l)) / pred_l, where x + s_l moves
                          only block l (one extra forward pass per block, no
                          Jacobians). Only blocks with rho_l >= eta1 move.
-           rho_batch:    'current' measures the per-layer and combined ratios on the
-                         batch that produced the step; 'next' measures them on an
-                         independent batch (loss_only_val), so a step that only
-                         fits the current batch cannot pass. Curvature pairs still
-                         come from the current batch.
+           rho_batch:    'current' measures the ratios on the batch that produced
+                         the step; any other value ('next': an independent batch of
+                         the same size, 'large': a larger batch that contains the
+                         current one) measures them on the batch behind
+                         loss_only_val, so a step that only fits the current batch
+                         cannot pass. The gradient in the model is always the
+                         current batch's.
+           use_pairs:    False stores no curvature pairs, so B = delta_fallback * I
+                         (ablation: cubic regularization without quasi-Newton curvature).
+           y_batch:      'current' : same-batch pairs use the current batch;
+                         'rho'     : same-batch pairs use the ratio batch
+                         (grad_val), y = g_R(x + s) - g_R(x); its two loss values
+                         are reused for the ratio, so no extra forward passes.
            mu_floor_kappa: if > 0, also track a global mu_g (updated by the
                          combined ratio) and keep every mu_l >= mu_g / kappa.
            hess_beta:    alpha in  B~_{t+1} = alpha B~_t + (1 - alpha) B_new,
@@ -199,6 +209,8 @@ class ARCsLSR1:
         self.mus = [mu0] * len(self.blocks)  # mus[0] is the shared mu when not per-layer
         self.rho_batch = rho_batch
         self.mu_floor_kappa = mu_floor_kappa
+        self.y_batch = y_batch
+        self.use_pairs = use_pairs
         self.mu_g = mu0  # global mu used only for the mu_l floor
         self._prev_g = None
         self._prev_s = None
@@ -437,19 +449,22 @@ class ARCsLSR1:
         self.mus = [v] * len(self.blocks)
 
     def _push_pairs(self, s: torch.Tensor, y: torch.Tensor):
+        if not self.use_pairs:
+            return
         for blk in self.blocks:
             sb = s[blk.start:blk.end]
             if float(sb.abs().max()) == 0.0:  # block did not move: no curvature pair
                 continue
             self._add_pair(blk, sb, y[blk.start:blk.end])
 
-    def step(self, x: torch.Tensor, loss_and_grad, loss_only, loss_only_val=None) -> dict:
+    def step(self, x: torch.Tensor, loss_and_grad, loss_only, loss_only_val=None, grad_val=None) -> dict:
         """One ARCs-LSR1 iteration on one mini-batch.
 
         x                flat float32 parameters (updated in place)
         loss_and_grad(x) -> (float loss, float32 grad) on the CURRENT batch
         loss_only(x)     -> float loss on the CURRENT batch
-        loss_only_val(x) -> float loss on an independent batch (rho_batch='next')
+        loss_only_val(x) -> float loss on the ratio batch (rho_batch != 'current')
+        grad_val(x)      -> (float loss, float32 grad) on the ratio batch (y_batch='rho')
         """
         self.k += 1
         f0, g32 = loss_and_grad(x)
@@ -488,14 +503,18 @@ class ARCsLSR1:
         finite_step = bool(torch.isfinite(s_full).all())
 
         rho_b = [float("nan")] * nb
-        g1_32 = None
+        y_same = None  # same-batch curvature pair, measured along s_pairs
+        use_val = self.rho_batch != "current" and loss_only_val is not None
+        y_val = self.y_mode == "same" and self.y_batch == "rho" and use_val and grad_val is not None
         if per_layer_mu:
             # Aditya's suggestion: per-layer ratio from f with only layer l moved.
             # f_test is the batch the ratios are measured on (current or next).
-            use_val = self.rho_batch == "next" and loss_only_val is not None
             f_test = loss_only_val if use_val else loss_only
             f0_t = f0
-            if use_val:
+            if y_val and finite_step:
+                f0_t, gv0 = grad_val(x)
+                n_grad += 1
+            elif use_val:
                 f0_t = loss_only_val(x)
                 n_fwd += 1
             f_b = [float("inf")] * nb
@@ -521,15 +540,21 @@ class ARCsLSR1:
             rho_comb = -float("inf")
             if A:
                 x_trial = x + s_take.to(x.dtype)
-                if self.y_mode == "same":
-                    f1, g1_32 = loss_and_grad(x_trial)  # y on the current batch
+                if y_val:
+                    f1, gv1 = grad_val(x_trial)  # y and ratio on the ratio batch
+                    y_same = gv1.to(DT) - gv0.to(DT)
                     n_grad += 1
-                if use_val:
-                    f1 = loss_only_val(x_trial)
-                    n_fwd += 1
-                elif self.y_mode != "same":
-                    f1 = loss_only(x_trial)
-                    n_fwd += 1
+                else:
+                    if self.y_mode == "same":
+                        f1, g1_32 = loss_and_grad(x_trial)  # y on the current batch
+                        y_same = g1_32.to(DT) - g
+                        n_grad += 1
+                    if use_val:
+                        f1 = loss_only_val(x_trial)
+                        n_fwd += 1
+                    elif self.y_mode != "same":
+                        f1 = loss_only(x_trial)
+                        n_fwd += 1
                 pred = sum(preds[i] for i in A)
                 rho_comb = (f0_t - f1) / pred if (math.isfinite(f1) and pred > 0) else -float("inf")
             else:
@@ -567,15 +592,28 @@ class ARCsLSR1:
             s_take = s_full
             pred = sum(preds)
             x_trial = x + s_full.to(x.dtype)
+            f0_t = f0
             if not finite_step:
                 f1 = float("inf")
-            elif self.y_mode == "same":
-                f1, g1_32 = loss_and_grad(x_trial)
-                n_grad += 1
+            elif y_val:
+                # y and both ratio values on the ratio batch
+                f0_t, gv0 = grad_val(x)
+                f1, gv1 = grad_val(x_trial)
+                y_same = gv1.to(DT) - gv0.to(DT)
+                n_grad += 2
             else:
-                f1 = loss_only(x_trial)
-                n_fwd += 1
-            rho = (f0 - f1) / pred if (finite_step and math.isfinite(f1) and pred > 0) else -float("inf")
+                if self.y_mode == "same":
+                    f1, g1_32 = loss_and_grad(x_trial)
+                    y_same = g1_32.to(DT) - g
+                    n_grad += 1
+                if use_val:
+                    f0_t = loss_only_val(x)
+                    f1 = loss_only_val(x_trial)
+                    n_fwd += 2
+                elif self.y_mode != "same":
+                    f1 = loss_only(x_trial)
+                    n_fwd += 1
+            rho = (f0_t - f1) / pred if (finite_step and math.isfinite(f1) and pred > 0) else -float("inf")
             accepted = rho >= self.eta1
             self.mus = [self._mu_next(self.mus[0], rho)] * nb
             s_pairs = s_full
@@ -585,8 +623,8 @@ class ARCsLSR1:
             x.copy_(x_trial)
         # same-batch pair (Direction 3). Curvature info is valid whether or not
         # the step is accepted (Nocedal & Wright, Alg. 6.2).
-        if self.y_mode == "same" and g1_32 is not None:
-            self._push_pairs(s_pairs, g1_32.to(DT) - g)
+        if self.y_mode == "same" and y_same is not None:
+            self._push_pairs(s_pairs, y_same)
 
         self._prev_g = g
         self._prev_s = s_take if accepted else None
