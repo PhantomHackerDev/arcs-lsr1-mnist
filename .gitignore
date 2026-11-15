@@ -6,6 +6,7 @@ __pycache__/
 results/*.json
 !results/summary.json
 !results/round6_selection.json
+!results/round9_selection.json
 results/logs/
 results_*.log
 # personal files that must never be committed

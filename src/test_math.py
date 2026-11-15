@@ -227,5 +227,24 @@ check("large ratio batch: rho is measured on the ratio function", abs(d["rho"] -
 check("y_batch='rho': stored y = g_R(x+s) - g_R(x)", torch.allclose(Y_, Dr * S_, rtol=1e-5, atol=1e-6),
       f"(max err {float((Y_ - Dr * S_).abs().max()):.1e})")
 
+# 10. delta rule 'safe_keep': keeps the previous delta when lambda_hat_min <= 0 -----
+#     (a pair with negative curvature makes lambda_hat_min < 0; 'safe' resets to the fallback)
+o_s = ARCsLSR1(4, history=3, delta_mode="safe")
+o_k = ARCsLSR1(4, history=3, delta_mode="safe_keep")
+A_pos, St = torch.eye(2, dtype=DT), torch.eye(2, dtype=DT)
+A_neg = torch.diag(torch.tensor([1.0, -1.0], dtype=DT))
+res = []
+for o in (o_s, o_k):
+    blk = o.blocks[0]
+    d1, lam1 = o._choose_delta(blk, A_pos, St)
+    blk.delta = d1
+    d2, lam2 = o._choose_delta(blk, A_neg, St)
+    res.append((d1, lam1, d2, lam2))
+check("'safe' and 'safe_keep' agree when lambda_hat_min > 0",
+      res[0][0] == res[1][0] and abs(res[0][0] - o_s.safe_frac) < 1e-9, f"(delta {res[0][0]:.12g})")
+check("lambda_hat_min < 0: 'safe' resets to delta_fallback, 'safe_keep' keeps the previous delta",
+      res[0][2] == o_s.delta_fallback and res[1][2] == res[1][0] and res[1][3] < 0,
+      f"(safe {res[0][2]:g}, safe_keep {res[1][2]:g}, lambda_hat_min {res[1][3]:g})")
+
 print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

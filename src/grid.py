@@ -140,6 +140,17 @@ def _r8(base, name):
 ROUND8_FM = _r8(C, "fm")
 ROUND8_DEEP = _r8(D, "deep")
 
+# Round 9 (F-MNIST CNN, batch 1024-4096): Aditya's point that eta2 = 0.75 is too optimistic.
+# Lower eta2 (eta1 = 0.1 kept) with the floor mu_min, with and without curvature pairs.
+# eta2 = 0.75 is round 8's r8_fm_* (run at the new batch sizes with --suite round8_fm).
+ROUND9_FM = {}
+for e2 in (0.5, 0.25):
+    for v in (1e-8, 1, 4, 16, 64, 256):
+        vn = "0" if v < 1e-3 else f"{v:g}"
+        for pn, pa in (("pairs", ""), ("nopairs", "--no_pairs ")):
+            ROUND9_FM[f"r9_fm_{pn}_eta2_{e2:g}_mumin{vn}"] = (
+                C + f"--opt arcs --y_mode same --probe_every 0 {pa}--eta2 {e2:g} --mu_min {v:g}")
+
 MODERN_FMNIST = {f"fm_{o}_lr{lr:g}": C + f"--opt {o} --lr {lr:g}" for o, lrs in LRS.items() for lr in lrs}
 
 
@@ -153,7 +164,7 @@ def main():
     ap.add_argument("--only", default="", help="comma list of config names")
     ap.add_argument("--suite", default="main", choices=["main", "layer", "memory", "fix", "flip", "secant", "fmnist",
                                                    "modern_mnist", "modern_fmnist", "round7",
-                                                   "round8_fm", "round8_deep"])
+                                                   "round8_fm", "round8_deep", "round9_fm"])
     a = ap.parse_args()
     outdir = os.path.join(ROOT, "results")
     logdir = os.path.join(ROOT, "results", "logs")
@@ -182,6 +193,8 @@ def main():
         confs = ROUND8_FM
     elif a.suite == "round8_deep":
         confs = ROUND8_DEEP
+    elif a.suite == "round9_fm":
+        confs = ROUND9_FM
     else:
         confs = SECANT
     if a.only:

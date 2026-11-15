@@ -31,6 +31,10 @@ Knobs added for the study (defaults reproduce the paper's method)
                'safe'   : delta = safe_frac * lambda_hat_min when that is
                           positive, otherwise delta_fallback  (strictly below
                           lambda_hat_min, the condition in Erway et al. 2020)
+               'safe_keep': as 'safe', but when lambda_hat_min <= 0 keep the
+                          previous delta instead of resetting to delta_fallback
+                          (with many pairs lambda_hat_min can stay negative, and
+                          'safe' then runs with delta = delta_fallback throughout)
                'bb'     : delta = y^T y / s^T y of the newest pair (clipped)
                'const'  : delta = delta_fallback
   y_mode       'cross'  : y_k = g_{B_{k+1}}(x_{k+1}) - g_{B_k}(x_k)
@@ -239,8 +243,11 @@ class ARCsLSR1:
         mode = self.delta_mode
         if mode == "paper":
             d = lam_hat_min if math.isfinite(lam_hat_min) else self.delta_fallback
-        elif mode == "safe":
-            d = self.safe_frac * lam_hat_min if (math.isfinite(lam_hat_min) and lam_hat_min > 0) else self.delta_fallback
+        elif mode in ("safe", "safe_keep"):
+            if math.isfinite(lam_hat_min) and lam_hat_min > 0:
+                d = self.safe_frac * lam_hat_min
+            else:  # 'safe' resets to delta_fallback; 'safe_keep' keeps the previous delta
+                d = self.delta_fallback if mode == "safe" else blk.delta
         elif mode == "bb":
             s, y = blk.newest()
             sy = float(s @ y)

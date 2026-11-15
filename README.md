@@ -378,7 +378,7 @@ Full table, including every screened configuration: [results/summary_round7.md](
 
 **4. Without curvature pairs (B = I), the result is the same within seed noise:** 0.211 vs. 0.203 at μ_min = 64, and 0.213 vs. 0.220 at μ_min = 16.
 - At μ_min = 64, the cubic term μ‖s‖ ≈ 8.1, while B has δ ≈ 1.6 and λ_max ≈ 18.
-- The curvature changes the step only inside the 2m = 20-dimensional span of the pairs. The rest of the 21,840-dimensional step is scaled by 1/(δ + μ‖s‖), just as it would be with B = I.
+- The curvature changes the step only inside the range of Ψ = Y − δS, at most m = 10 dimensions (within the span of the pairs). The rest of the 21,840-dimensional step is scaled by 1/(δ + μ‖s‖), just as it would be with B = I.
 - So on this problem the improvement comes from bounding the step, not from the L-SR1 curvature.
 
 **5. Combinations add nothing** (seed 0): μ_min = 16 together with η₁ = 0.5, or with the ratio test on 256 samples, or with pairs + ratio test on 256 samples, gives 0.208–0.227.
@@ -404,7 +404,7 @@ The last epoch alone is a noisy measure. On MNIST, the late-training loss jumps 
 **1. The L-SR1 curvature helps once the gradient is less noisy.**
 - At batch 256 and 1024 on F-MNIST, and at batch 256 on MNIST, the pairs lower the training loss by roughly 30–50% at every epoch.
 - At batch 64 they make no difference (round 7).
-- This fits the round-7 picture: the curvature acts only in the 2m directions spanned by the pairs, and those pairs are only useful when they are not dominated by gradient noise.
+- This fits the round-7 picture: the curvature acts only in the (at most) m directions of Ψ = Y − δS, and those pairs are only useful when they are not dominated by gradient noise.
 
 **2. On MNIST the final epoch hides this.**
 - At μ_min = 4, one seed jumped from 0.0056 to 0.0159 in the last epoch, so the final values overlap.
@@ -419,7 +419,55 @@ The last epoch alone is a noisy measure. On MNIST, the late-training loss jumps 
 - On F-MNIST at batch 256, tuned ARCs-LSR1 (0.227, 89.09%) beats the paper's SGD (0.259) and Adam (0.269).
 - It still trails the tuned AdamW (0.210), SophiaG (0.196), Shampoo (0.146) and Muon (0.139), and it costs twice as much per epoch.
 - On MNIST, Muon (0.00014) and Shampoo (0.0005) remain well ahead.
-- I have not tuned the baselines at batch 1024.
+- I have not tuned the baselines at batch 1024 (done in round 9).
+
+## Round 9: larger batches (F-MNIST CNN, batch 1024 / 2048 / 4096)
+
+Aditya's next step: larger batches, plus his point that η₂ = 0.75 (75% agreement between the model and the actual decrease) is too optimistic.
+- **ARCs-LSR1** (full network, same-batch y, η₁ = 0.1, 10 epochs): the floor μ_min ∈ {none, 1, 4, 16, 64, 256} × η₂ ∈ {0.75, 0.5, 0.25}, with and without curvature pairs (B = I).
+- **Baselines** (20 epochs, so they can be compared at the same epoch and at the same compute; ARCs-LSR1 uses two gradients per step): SGD+momentum, AdamW, Muon, Shampoo, SophiaG with a learning-rate sweep extended until the best value is interior, and the paper's Adam (lr 1e-3). The lr is chosen separately at epoch 10 and at epoch 20.
+- Everything is selected by the seed-0 final **training** loss; the selected configurations have 3 seeds.
+- Then the L-SR1 memory m ∈ {5, 10, 20, 50, 100} at the selected (η₂, μ_min), 3 seeds.
+
+Full tables: [results/summary_round9.md](results/summary_round9.md), [fig 13](figures/fig13_large_batch.png) (per epoch and per compute), [fig 14](figures/fig14_memory.png) (memory m). Selections: [results/round9_selection.json](results/round9_selection.json).
+
+Training loss on the full training set (3 seeds); test accuracy in parentheses. "Epoch 10" compares the same number of samples and steps. "20 grads" compares the same compute (about 20 full-training-set gradients: 10 epochs for ARCs-LSR1, 20 for the baselines).
+
+| method | batch 1024: epoch 10 | 20 grads | batch 2048: epoch 10 | 20 grads | batch 4096: epoch 10 | 20 grads |
+|---|---|---|---|---|---|---|
+| ARCs-LSR1, m = 10 (paper) | 0.328 ± 0.047 (86.8) | same | 0.344 ± 0.008 (86.6) | same | 0.405 ± 0.009 (84.3) | same |
+| ARCs-LSR1, m = 50, γ rule safe_keep | 0.238 ± 0.009 (89.3) | same | **0.259 ± 0.007** (88.9) | same | 0.294 ± 0.019 (88.1) | same |
+| ARCs-LSR1, m = 100, γ rule safe_keep | **0.225 ± 0.010** (89.8) | same | 0.305 ± 0.102 (87.3) | same | **0.284 ± 0.017** (88.3) | same |
+| ARCs, no pairs (B = I) | 0.588 ± 0.046 (77.2) | same | 0.695 ± 0.079 (73.2) | same | 0.775 ± 0.073 (70.8) | same |
+| SGD+momentum (tuned) | 0.276 (88.2) | 0.230 | 0.337 (86.4) | 0.273 | 0.427 (83.4) | 0.324 |
+| Adam (paper, lr 1e-3) | 0.349 (86.5) | 0.285 | 0.405 (84.6) | 0.331 | 0.484 (81.3) | 0.394 |
+| AdamW (tuned) | 0.224 (89.3) | 0.173 | 0.259 (88.7) | 0.200 | 0.316 (87.3) | 0.248 |
+| SophiaG (tuned) | 0.233 (89.0) | 0.156 | 0.261 (88.5) | 0.193 | 0.338 (86.5) | 0.230 |
+| Shampoo (tuned) | 0.164 (89.6) | 0.126 | 0.189 (89.8) | 0.128 | 0.248 (89.1) | 0.166 |
+| Muon (tuned) | 0.138 (90.4) | 0.072 | 0.136 (89.6) | 0.078 | 0.189 (89.5) | 0.085 |
+
+**1. Lowering η₂ makes no consistent difference at these batch sizes.**
+- The best seed-0 loss for η₂ = 0.75 / 0.5 / 0.25 is 0.305 / 0.288 / 0.295 at batch 1024, 0.351 / 0.373 / 0.368 at batch 2048 and 0.406 / 0.406 / 0.425 at batch 4096. Those differences are within the spread between seeds.
+- The seed-0 selection is itself noisy: at batch 1024 it picked η₂ = 0.5, μ_min = 1 (seed 0: 0.288), which over 3 seeds gives 0.328 ± 0.047, while round 8's η₂ = 0.75, μ_min = 4 gives 0.296 ± 0.009.
+- The best floor is μ_min = 1 at every batch size. μ is above it in 39–96% of the steps, and 23–34% of the steps are rejected (m = 10), so the ARC adaptation is fully active.
+
+**2. The curvature pairs halve the training loss at every batch size**: 0.33 vs. 0.59, 0.34 vs. 0.70 and 0.41 vs. 0.78 against B = I at its own best setting.
+
+**3. With the paper's m = 10, ARCs-LSR1 is only at the level of tuned SGD. The memory is the bottleneck.**
+- B differs from δI only in the range of Ψ = Y − δS, at most m = 10 of the 21,840 dimensions. In all other directions the step is the gradient scaled by 1/(δ + μ‖s‖). With δ ≈ 0.2 and μ‖s‖ ≈ 1 this is roughly the step of SGD with lr 0.1 and momentum 0.9 (effective lr 1).
+- More memory helps steadily (fig 14): from m = 10 to m = 100 the loss drops from 0.328 to 0.225 at batch 1024 and from 0.405 to 0.284 at batch 4096. Accepted steps go from 66–77% to 92–99%. m = 5 is much worse (0.42–0.55).
+- The cost is small at this model size: the optimizer's own arithmetic is at most 1% of the model's forward/backward FLOPs at m = 100 (0.1% at m = 10).
+
+**4. The paper's γ rule breaks down with many pairs.**
+- The 'safe' rule sets γ = λ̂_min / 2, where λ̂_min is the smallest generalized eigenvalue of (D + L + Lᵀ, SᵀS), and falls back to γ = 1 when λ̂_min ≤ 0.
+- At batch 2048, λ̂_min ≤ 0 in 1.4% of the steps at m = 10, 18% at m = 20 and 99.7% at m = 50. The m = 50 run then trains with γ = 1 throughout and is worse than m = 10 (0.408).
+- Keeping the previous γ instead ('safe_keep', `--delta_mode safe_keep`; identical to 'safe' whenever λ̂_min > 0) fixes m = 50 (0.259 ± 0.007).
+- At m = 100 the problem returns: λ̂_min ≤ 0 in 33% of the steps and one of three seeds is much worse (0.305 ± 0.102). How to choose γ, or how to handle pairs with negative curvature, when m is large is still open.
+
+**5. Against the tuned baselines:**
+- **Per epoch**, ARCs-LSR1 with m = 50–100 matches AdamW and SophiaG at batch 1024 and 2048 and beats them at batch 4096 (0.284 vs. 0.316 and 0.338). It beats tuned SGD and the paper's Adam everywhere, but stays behind Shampoo and Muon.
+- **At equal compute**, AdamW, SophiaG, Shampoo and Muon are all ahead, because each ARCs-LSR1 step costs two gradients. ARCs-LSR1 matches SGD at batch 1024 (0.225 vs. 0.230) and beats it at batch 4096 (0.284 vs. 0.324).
+- Shampoo and Muon precondition every direction through the per-layer (Kronecker) structure, while ARCs-LSR1 only corrects m directions. A non-scalar initial matrix B₀ (diagonal, or per-layer Kronecker factors as in K-BFGS, Goldfarb, Ren and Bahamou 2020), with the L-SR1 correction on top, would address this directly. The cubic term would then be measured in the corresponding scaled norm.
 
 ## Using it as a `torch.optim` optimizer
 
@@ -473,7 +521,7 @@ for xb, yb in loader:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 22 sanity checks
+.venv/bin/python src/test_math.py                       # 24 sanity checks
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
@@ -509,5 +557,10 @@ python3 -m venv .venv
 .venv/bin/python src/grid.py --suite round8_fm --bs 256,1024 --seeds 1,2 --only r8_fm_pairs_mumin4,r8_fm_nopairs_mumin4,r8_fm_nopairs_mumin1
 .venv/bin/python src/grid.py --suite round8_deep --bs 256 --seeds 1,2 --only r8_deep_pairs_mumin4,r8_deep_nopairs_mumin1
 .venv/bin/python src/analyze_round8.py
+# round 9 (F-MNIST batch 1024/2048/4096: tuned baselines over 20 epochs, ARCs mu_min x eta2 with / without pairs,
+# then the L-SR1 memory m and the delta rule 'safe_keep'), ~4 h on 16 CPU cores
+.venv/bin/python src/sweep_round9.py --workers 13            # -> results/round9_selection.json
+.venv/bin/python src/sweep_round9m.py --workers 13
+.venv/bin/python src/analyze_round9.py
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```
