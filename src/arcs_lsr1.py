@@ -35,6 +35,13 @@ Knobs added for the study (defaults reproduce the paper's method)
                           previous delta instead of resetting to delta_fallback
                           (with many pairs lambda_hat_min can stay negative, and
                           'safe' then runs with delta = delta_fallback throughout)
+               'safe_lm': as 'safe_keep', and when lambda_hat_min <= 0 the pairs are
+                          LM-damped, y_i -> y_i + lam s_i with lam = delta_prev /
+                          safe_frac - lambda_hat_min (the K-BFGS-style damping of
+                          Goldfarb et al. 2020, made adaptive). This shifts every
+                          generalized eigenvalue by lam, so delta = delta_prev is
+                          again below lambda_hat_min and B >= delta I. By the shift
+                          invariance of SR1, B = SR1(B0 = (delta - lam) I) + lam I.
                'bb'     : delta = y^T y / s^T y of the newest pair (clipped)
                'const'  : delta = delta_fallback
   y_mode       'cross'  : y_k = g_{B_{k+1}}(x_{k+1}) - g_{B_k}(x_k)
@@ -165,6 +172,8 @@ class ARCsLSR1:
         mu_floor_kappa: float = 0.0,
         y_batch: str = "current",
         use_pairs: bool = True,
+        double_grad: bool = False,
+        double_grad_ratio: bool = False,
     ):
         """mu_per_layer: one mu_l per block, each adapted by its own ratio
                          rho_l = (f(x) - f(x + s_l)) / pred_l, where x + s_l moves
@@ -177,6 +186,15 @@ class ARCsLSR1:
                          loss_only_val, so a step that only fits the current batch
                          cannot pass. The gradient in the model is always the
                          current batch's.
+           double_grad:  the model gradient is the average of the current batch's
+                         gradient and the previous batch's gradient AT THE SAME POINT,
+                         which the same-batch pair already computed (g_{B_{k-1}}(x_k)
+                         = g_{B_{k-1}}(x_{k-1} + s_{k-1}) after an accepted step, or
+                         g_{B_{k-1}}(x_{k-1}) after a rejected one): a gradient over
+                         two batches at no extra cost (Goldfarb et al. 2020, App. D.6).
+                         Needs y_mode='same' and the full-network path.
+           double_grad_ratio: also measure the ratio on the average of the two
+                         batches' losses (one extra forward pass on the previous batch).
            use_pairs:    False stores no curvature pairs, so B = delta_fallback * I
                          (ablation: cubic regularization without quasi-Newton curvature).
            y_batch:      'current' : same-batch pairs use the current batch;
@@ -215,6 +233,15 @@ class ARCsLSR1:
         self.mu_floor_kappa = mu_floor_kappa
         self.y_batch = y_batch
         self.use_pairs = use_pairs
+        self.double_grad = double_grad or double_grad_ratio
+        self.double_grad_ratio = double_grad_ratio
+        if self.double_grad:
+            assert y_mode == "same" and not mu_per_layer and grad_beta == 0 and rho_batch == "current", \
+                "double_grad: same-batch y, full-network step, no gradient EMA, ratio on the current batch(es)"
+        self._g_next = None  # previous batch's gradient at the next iterate
+        self._f_next = None  # previous batch's loss at the next iterate
+        self._lo_next = None  # previous batch's loss closure
+        self._last_g_model = None
         self.mu_g = mu0  # global mu used only for the mu_l floor
         self._prev_g = None
         self._prev_s = None
@@ -243,7 +270,7 @@ class ARCsLSR1:
         mode = self.delta_mode
         if mode == "paper":
             d = lam_hat_min if math.isfinite(lam_hat_min) else self.delta_fallback
-        elif mode in ("safe", "safe_keep"):
+        elif mode in ("safe", "safe_keep", "safe_lm"):
             if math.isfinite(lam_hat_min) and lam_hat_min > 0:
                 d = self.safe_frac * lam_hat_min
             else:  # 'safe' resets to delta_fallback; 'safe_keep' keeps the previous delta
@@ -262,7 +289,7 @@ class ARCsLSR1:
 
     def _decompose(self, blk: BlockState) -> dict:
         """delta, U_par, Lambda_hat for one block (Alg. 1 steps 3-8)."""
-        info = {"k": blk.k, "lam_hat_min": float("nan"), "cond_minv": float("nan"),
+        info = {"k": blk.k, "lam_hat_min": float("nan"), "cond_minv": float("nan"), "lm": 0.0,
                 "cond_psi": float("nan"), "eig_max_abs": 0.0, "bad": 0}
         if blk.k == 0:
             blk.Wfull, blk.lam_hat = None, None
@@ -281,13 +308,22 @@ class ARCsLSR1:
         blk.delta = delta
         info["delta"] = delta
         info["lam_hat_min"] = lam_hat_min
+        # 'safe_lm': LM damping y -> y + lm s when lambda_hat_min <= 0. With Y~ = Y + lm S,
+        # A~ = A + lm S^T S and Psi~ = Y~ - delta S = Y - (delta - lm) S, so everything below
+        # is the undamped formula with d_psi = delta - lm in place of delta, while the
+        # identity part of B stays delta.
+        lm = 0.0
+        if self.delta_mode == "safe_lm" and math.isfinite(lam_hat_min) and lam_hat_min <= 0:
+            lm = delta / self.safe_frac - lam_hat_min
+        info["lm"] = lm
+        d_psi = delta - lm
 
-        Minv = A - delta * StS
+        Minv = A - d_psi * StS
         sv = torch.linalg.svdvals(Minv)
         info["cond_minv"] = float(sv[0] / sv[-1]) if float(sv[-1]) > 0 else float("inf")
 
         # Psi^T Psi from Gram blocks; orthonormal basis of range(Psi)
-        PtP = YtY - delta * (SY + SY.T) + delta * delta * StS
+        PtP = YtY - d_psi * (SY + SY.T) + d_psi * d_psi * StS
         PtP = 0.5 * (PtP + PtP.T)
         sig, V = torch.linalg.eigh(PtP)
         smax = float(sig[-1])
@@ -313,7 +349,7 @@ class ARCsLSR1:
         W = (V / sig.sqrt()) @ P  # U_par = Psi W   (k x r)
         Wfull = torch.zeros(2 * m, W.shape[1], dtype=DT)
         Wfull[Yi] = W
-        Wfull[Si] = -delta * W
+        Wfull[Si] = -d_psi * W
         blk.Wfull, blk.lam_hat = Wfull, lam_hat
         info["eig_max_abs"] = float(lam_hat.abs().max())
         return info
@@ -492,6 +528,9 @@ class ARCsLSR1:
             g_model = self._g_ema / (1 - self.grad_beta ** self._ema_t)
         else:
             g_model = g
+        if self.double_grad and self._g_next is not None:
+            g_model = 0.5 * (g + self._g_next)  # two batches, both at the current x
+        self._last_g_model = g_model
 
         per_layer_mu = self.mu_per_layer and nb > 1
         mu_used = list(self.mus) if per_layer_mu else [self.mus[0]] * nb
@@ -613,6 +652,12 @@ class ARCsLSR1:
                     f1, g1_32 = loss_and_grad(x_trial)
                     y_same = g1_32.to(DT) - g
                     n_grad += 1
+                if self.double_grad_ratio and self._lo_next is not None:
+                    # ratio of the two-batch average loss, the function g_model belongs to
+                    f1_cur = f1
+                    f0_t = 0.5 * (f0 + self._f_next)
+                    f1 = 0.5 * (f1 + self._lo_next(x_trial))
+                    n_fwd += 1
                 if use_val:
                     f0_t = loss_only_val(x)
                     f1 = loss_only_val(x_trial)
@@ -622,6 +667,14 @@ class ARCsLSR1:
                     n_fwd += 1
             rho = (f0_t - f1) / pred if (finite_step and math.isfinite(f1) and pred > 0) else -float("inf")
             accepted = rho >= self.eta1
+            if self.double_grad:
+                if self.double_grad_ratio and self._lo_next is not None:
+                    f1 = f1_cur
+                ok = finite_step and y_same is not None
+                # this batch's gradient and loss at the next iterate, for the next step
+                self._g_next = (g1_32.to(DT) if accepted else g) if ok else None
+                self._f_next = (f1 if accepted else f0) if ok else None
+                self._lo_next = loss_only if ok else None
             self.mus = [self._mu_next(self.mus[0], rho)] * nb
             s_pairs = s_full
             self._fallback = 0
@@ -652,7 +705,7 @@ class ARCsLSR1:
             "delta": col("delta"), "lam_min": col("lam_min"), "lam_max": col("lam_max"),
             "n_neg": col("n_neg"), "lam_hat_min": col("lam_hat_min"), "cond_minv": col("cond_minv"),
             "cond_psi": col("cond_psi"), "eig_max_abs": col("eig_max_abs"), "bad": col("bad"),
-            "k_pairs": col("k"), "sec_res": col("sec_res"),
+            "k_pairs": col("k"), "sec_res": col("sec_res"), "lm": col("lm"),
         }
 
     # ------------------------------------------------------------------ diagnostics

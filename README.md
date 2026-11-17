@@ -469,6 +469,55 @@ Training loss on the full training set (3 seeds); test accuracy in parentheses. 
 - **At equal compute**, AdamW, SophiaG, Shampoo and Muon are all ahead, because each ARCs-LSR1 step costs two gradients. ARCs-LSR1 matches SGD at batch 1024 (0.225 vs. 0.230) and beats it at batch 4096 (0.284 vs. 0.324).
 - Shampoo and Muon precondition every direction through the per-layer (Kronecker) structure, while ARCs-LSR1 only corrects m directions. A non-scalar initial matrix B₀ (diagonal, or per-layer Kronecker factors as in K-BFGS, Goldfarb, Ren and Bahamou 2020), with the L-SR1 correction on top, would address this directly. The cubic term would then be measured in the corresponding scaled norm.
 
+## Round 10: two ideas from K-BFGS (Goldfarb, Ren & Bahamou, NeurIPS 2020)
+
+Same setting as round 9: F-MNIST CNN, full network, same-batch y, 10 epochs, 3 seeds. Full tables: [results/summary_round10.md](results/summary_round10.md), [fig 15](figures/fig15_round10.png).
+
+**(a) LM damping in the δ rule (`--delta_mode safe_lm`).**
+- K-BFGS keeps its BFGS factors well conditioned with a Levenberg–Marquardt-type damping, y ← y + λs. SR1 needs no positive definiteness, but this damping has two exact properties that matter for the δ rule (both checked in `src/test_math.py`):
+  - it shifts every generalized eigenvalue of (D + L + Lᵀ, SᵀS) by λ: λ̂_min(S, Y + λS) = λ̂_min(S, Y) + λ;
+  - SR1 is shift invariant: the pairs (s, y + λs) with B₀ = (δ + λ)I give B + λI.
+- 'safe_lm' is 'safe' whenever λ̂_min > 0. When λ̂_min ≤ 0, it keeps δ = δ_prev and damps the pairs with λ = δ_prev/0.5 − λ̂_min, so δ is again below the shifted λ̂_min. Then B = SR1(B₀ = (δ − λ)I) + λI ⪰ δI: the directions outside range(Ψ) are unchanged, and the negative curvature in range(Ψ) is shifted up.
+
+| batch 2048, training loss after 10 epochs | m = 20 | m = 50 | m = 100 | m = 200 |
+|---|---|---|---|---|
+| safe (paper; seed 0) | 0.328 | 0.408 | – | – |
+| safe_keep | 0.322 ± 0.023 | 0.259 ± 0.007 | 0.305 ± 0.102 | 0.477 (seed 0) |
+| **safe_lm** | **0.312 ± 0.005** | **0.258 ± 0.008** | **0.243 ± 0.014** | **0.238 ± 0.010** |
+
+- With the damping, more memory keeps helping at batch 2048, up to m = 100, and m = 200 is about the same. Without it, the large-m runs break down (λ̂_min ≤ 0 in 33–99.7% of the steps).
+- At batch 1024 and 4096, λ̂_min stays positive, so 'safe_lm' = 'safe_keep' = 'safe'. There, m = 200 gives 0.215 ± 0.012 and 0.282 ± 0.018 (m = 100: 0.225 and 0.284).
+
+**(b) Model gradient over two batches at no extra cost (`--double_grad`).**
+- K-BFGS (their App. D.6) reuses the gradient from its second forward/backward pass. ARCs-LSR1 can do the same: the same-batch pair already computes g_{B_{k−1}}(x_{k−1} + s_{k−1}), which after an accepted step is the previous batch's gradient **at the current point** (after a rejected step, g_{B_{k−1}}(x_{k−1}) is). The model gradient becomes the mean of the two batches at the same point: an unbiased gradient over twice the samples, not a stale average like momentum.
+- The ratio and the curvature pairs stay on the current batch. `--double_grad_ratio` also measures the ratio on the two-batch mean loss (one extra forward pass, +18% compute).
+
+| m = 50, training loss after 10 epochs | batch 256 | batch 1024 | batch 2048 | batch 4096 |
+|---|---|---|---|---|
+| reference (safe_lm; = safe_keep at 1024 and 4096, where λ̂_min > 0 throughout) | 0.210 ± 0.008 | 0.238 ± 0.009 | 0.258 ± 0.008 | 0.294 ± 0.019 |
+| **double_grad (safe_lm)** | **0.173 ± 0.002** | **0.195 ± 0.004** | 0.257 ± 0.040 | 0.284 ± 0.030 |
+| ratio double_grad / reference, per epoch | 0.81–0.93 | 0.82–0.95 | 0.90–0.99 | 0.79–0.99 |
+| double_grad (safe_keep) | 0.172 ± 0.007 | 0.237 ± 0.059 | 0.306 ± 0.069 | 0.335 ± 0.118 |
+| double_grad + ratio (safe_keep) | 0.176 ± 0.004 | 0.225 ± 0.044 | 0.338 ± 0.029 | 0.308 ± 0.066 |
+
+1. **With safe_lm, double_grad lowers the training loss at every epoch and every batch size, at no extra cost.** The gain is 5–19% at every epoch at batch 256 and 1024. At batch 2048 and 4096 the final values overlap because of one seed each (see 3).
+2. **With safe_keep, double_grad is unstable at batch ≥ 1024.** In the bad seeds λ̂_min ≤ 0 from the first iterations onward, so 'safe_keep' freezes δ at its first value (0.3–0.46). The seeds where λ̂_min stays positive improve (batch 4096: 0.263 and 0.271 vs. 0.294).
+3. **What is still open:** with safe_lm, one seed at batch 2048 and one at 4096 have λ̂_min ≤ 0 in 99% of the steps. δ is then never re-estimated, and those seeds end at 0.30 and 0.32 (others: 0.23–0.27). With λ̂_min persistently ≤ 0, δ needs another estimate.
+4. Measuring the ratio on the two-batch mean as well gives no further gain for +18% compute.
+
+**Best ARCs-LSR1 so far vs. the tuned baselines (training loss after 10 epochs, per epoch):**
+
+| batch | best ARCs-LSR1 | AdamW | SophiaG | Shampoo | Muon |
+|---|---|---|---|---|---|
+| 256 | 0.173 (m = 50, double_grad) | 0.210 | 0.196 | 0.146 | 0.139 |
+| 1024 | 0.195 (m = 50, double_grad) | 0.224 | 0.233 | 0.164 | 0.138 |
+| 2048 | 0.238 (m = 200) | 0.259 | 0.261 | 0.189 | 0.136 |
+| 4096 | 0.282 (m = 200) | 0.316 | 0.338 | 0.248 | 0.189 |
+
+- Per epoch, ARCs-LSR1 now beats the tuned AdamW and SophiaG at every batch size from 256 to 4096 (at batch 2048 by a margin within the spread), but it still trails Shampoo and Muon.
+- At equal compute (each step costs two gradients), the round-9 picture is unchanged. For example, at batch 1024 AdamW reaches 0.173 and SophiaG 0.156 after 20 epochs.
+- m ≥ 100 combined with double_grad has not been tried yet.
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -521,7 +570,7 @@ for xb, yb in loader:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 24 sanity checks
+.venv/bin/python src/test_math.py                       # 32 sanity checks
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
@@ -562,5 +611,8 @@ python3 -m venv .venv
 .venv/bin/python src/sweep_round9.py --workers 13            # -> results/round9_selection.json
 .venv/bin/python src/sweep_round9m.py --workers 13
 .venv/bin/python src/analyze_round9.py
+# round 10 (K-BFGS ideas: LM damping in the delta rule 'safe_lm', model gradient over two batches 'double_grad')
+.venv/bin/python src/sweep_round10.py --workers 13
+.venv/bin/python src/analyze_round10.py
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

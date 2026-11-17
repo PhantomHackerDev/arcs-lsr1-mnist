@@ -246,5 +246,98 @@ check("lambda_hat_min < 0: 'safe' resets to delta_fallback, 'safe_keep' keeps th
       res[0][2] == o_s.delta_fallback and res[1][2] == res[1][0] and res[1][3] < 0,
       f"(safe {res[0][2]:g}, safe_keep {res[1][2]:g}, lambda_hat_min {res[1][3]:g})")
 
+# 11. delta rule 'safe_lm': LM damping of the pairs when lambda_hat_min <= 0 ------------
+torch.manual_seed(11)
+n11, m11 = 8, 3
+H11 = torch.diag(torch.linspace(-2.0, 3.0, n11, dtype=DT))  # indefinite curvature
+S11 = torch.randn(n11, m11, dtype=DT)
+Y11 = H11 @ S11
+
+
+def dense_sr1_from(B, S_, Y_):
+    for j in range(S_.shape[1]):
+        r = Y_[:, j] - B @ S_[:, j]
+        B = B + torch.outer(r, r) / (r @ S_[:, j])
+    return B
+
+
+def dense_B(o):
+    blk = o.blocks[0]
+    return torch.stack([o._Bv(blk, e) for e in torch.eye(n11, dtype=DT)], 1)
+
+
+def build(mode, S_, Y_, delta_prev=0.3):
+    o = ARCsLSR1(n11, history=m11, delta_mode=mode)
+    blk = o.blocks[0]
+    for j in range(S_.shape[1]):
+        blk.push(S_[:, j], Y_[:, j])
+    blk.delta = delta_prev
+    return o, o._decompose(blk)
+
+
+o_lm, inf_lm = build("safe_lm", S11, Y11)
+lh11 = inf_lm["lam_hat_min"]
+gam, lm11 = inf_lm["delta"], inf_lm["lm"]
+dps = gam - lm11
+SY11 = S11.T @ Y11
+A11 = torch.diag(torch.diagonal(SY11)) + torch.tril(SY11, -1) + torch.tril(SY11, -1).T
+Psi11 = Y11 - dps * S11
+B_exp = gam * torch.eye(n11, dtype=DT) + Psi11 @ torch.linalg.solve(A11 - dps * S11.T @ S11, Psi11.T)
+B_lm = dense_B(o_lm)
+check("'safe_lm': lambda_hat_min < 0 gives lam = delta_prev/safe_frac - lambda_hat_min and keeps delta",
+      lh11 < 0 and abs(lm11 - (0.3 / 0.5 - lh11)) < 1e-12 and gam == 0.3, f"(lambda_hat_min {lh11:.3f}, lam {lm11:.3f})")
+check("'safe_lm': B = delta I + Psi~ (A - (delta - lam) S^T S)^{-1} Psi~^T, Psi~ = Y - (delta - lam) S",
+      torch.allclose(B_lm, B_exp, atol=1e-10), f"(max err {float((B_lm - B_exp).abs().max()):.1e})")
+B_rec = dense_sr1_from(dps * torch.eye(n11, dtype=DT), S11, Y11) + lm11 * torch.eye(n11, dtype=DT)
+check("'safe_lm': B = SR1(B0 = (delta - lam) I) + lam I  (SR1 shift invariance)",
+      torch.allclose(B_lm, B_rec, atol=1e-9), f"(max err {float((B_lm - B_rec).abs().max()):.1e})")
+ev = torch.linalg.eigvalsh(0.5 * (B_lm + B_lm.T))
+check("'safe_lm': B >= delta I (positive definite)", float(ev[0]) >= gam - 1e-9, f"(lambda_min(B) {float(ev[0]):.4f})")
+Y11p = torch.diag(torch.linspace(0.5, 3.0, n11, dtype=DT)) @ S11  # positive curvature
+o_a, i_a = build("safe", S11, Y11p)
+o_b, i_b = build("safe_lm", S11, Y11p)
+check("'safe_lm' == 'safe' when lambda_hat_min > 0", i_b["lm"] == 0.0 and torch.equal(dense_B(o_a), dense_B(o_b)))
+
+
+# 12. double_grad: the model gradient averages two batches at the same point -------------
+def quad(D, c):
+    return (lambda xv: (float(0.5 * (D * (xv.to(DT) - c) ** 2).sum()), (D * (xv.to(DT) - c)).float()),
+            lambda xv: float(0.5 * (D * (xv.to(DT) - c) ** 2).sum()))
+
+
+torch.manual_seed(12)
+n12 = 10
+D12 = torch.linspace(0.5, 4.0, n12, dtype=DT)
+batches = [quad(D12, torch.randn(n12, dtype=DT)) for _ in range(10)]
+x_ref, x_dg = torch.randn(n12), None
+x_dg = x_ref.clone()
+o_ref = ARCsLSR1(n12, history=3, y_mode="same")
+o_dg = ARCsLSR1(n12, history=3, y_mode="same", double_grad_ratio=True)
+same = True
+for k in range(12):  # identical batches: the averages equal the single batch, bitwise
+    lg_, lo_ = batches[0]
+    d1, d2 = o_ref.step(x_ref, lg_, lo_), o_dg.step(x_dg, lg_, lo_)
+    same &= bool(torch.equal(x_ref, x_dg)) and d1["rho"] == d2["rho"]
+check("double_grad(_ratio) with identical batches reproduces the default bitwise", same)
+o_dg = ARCsLSR1(n12, history=3, y_mode="same", double_grad_ratio=True, mu0=0.01)  # small mu0: some rejections
+xk = torch.randn(n12)
+grad_ok, rho_ok, accs = True, True, []
+for k in range(1, 10):
+    lg_, lo_ = batches[k]
+    lg_p, lo_p = batches[k - 1]
+    x0 = xk.clone()
+    d = o_dg.step(xk, lg_, lo_)
+    accs.append(d["acc"])
+    if k > 1:
+        g_exp = 0.5 * (lg_(x0)[1].to(DT) + lg_p(x0)[1].to(DT))
+        grad_ok &= torch.allclose(o_dg._last_g_model, g_exp, atol=1e-6)
+        s_ = o_dg._last_s
+        fbar = lambda v: 0.5 * (lo_(v) + lo_p(v))  # noqa: E731
+        r_exp = (fbar(x0) - fbar(x0 + s_.float())) / d["pred"]
+        rho_ok &= abs(d["rho"] - r_exp) < 1e-6 * max(1.0, abs(r_exp))
+check("double_grad: model gradient = (g_B_k(x_k) + g_B_{k-1}(x_k)) / 2, after accepted and rejected steps",
+      grad_ok and 0 in accs[:-1] and 1 in accs[:-1], f"(accepted: {accs})")
+check("double_grad_ratio: rho is measured on the two-batch average loss", rho_ok)
+
 print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

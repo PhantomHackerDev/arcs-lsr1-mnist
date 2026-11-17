@@ -197,6 +197,11 @@ def main():
                          "training samples (sets --rho_batch large)")
     ap.add_argument("--y_on_rho", action="store_true",
                     help="same-batch curvature pairs on the ratio batch instead of the current batch")
+    ap.add_argument("--double_grad", action="store_true",
+                    help="model gradient = average of the current and the previous batch's gradient at the current "
+                         "point (reuses the same-batch pair's gradient; no extra cost)")
+    ap.add_argument("--double_grad_ratio", action="store_true",
+                    help="--double_grad, and the ratio on the two-batch average loss (one extra forward pass)")
     ap.add_argument("--no_pairs", action="store_true",
                     help="ablation: no curvature pairs, B = delta_fallback * I (cubic-regularized gradient step)")
     ap.add_argument("--eta1", type=float, default=0.1)
@@ -262,7 +267,8 @@ def main():
             stable_cubic=not a.unstable_cubic, mu_per_layer=a.mu_per_layer,
             hess_beta=a.hess_beta, rank_cap=a.rank_cap, rho_batch=a.rho_batch,
             mu_floor_kappa=a.mu_floor_kappa, eta1=a.eta1, eta2=a.eta2, mu_min=a.mu_min,
-            y_batch="rho" if a.y_on_rho else "current", use_pairs=not a.no_pairs)
+            y_batch="rho" if a.y_on_rho else "current", use_pairs=not a.no_pairs,
+            double_grad=a.double_grad, double_grad_ratio=a.double_grad_ratio)
         gen_rho = torch.Generator().manual_seed(2000 + a.seed)
     else:
         xp = x.clone().requires_grad_(True)
