@@ -579,6 +579,46 @@ Full table: [results/summary_round11.md](results/summary_round11.md), [fig 16](f
   For GPT-sized models, m = 50–100 does not fit next to the model on one GPU, so those runs need a small m, a per-layer split of the memory across devices, or a structured B₀ that needs fewer pairs.
 - **Template for the larger runs:** [examples/train_cifar10.py](examples/train_cifar10.py) trains ResNet-18 on CIFAR-10 with ARCs-LSR1 (through `ARCsLSR1Optim`), AdamW or SGD on any device. So far it is only smoke-tested on CPU with random data (`--data fake`).
 
+## Round 12: a diagonal initial matrix B₀ = δD
+
+Round 9 traced the gap to Shampoo and Muon to the directions outside the L-SR1 subspace, where B₀ = δI turns the step into a scaled gradient step. The first non-scalar B₀ is diagonal.
+
+- **Method** (`--diag_power p`): D = (√v̂ + ε)^p, normalized to mean 1, where v is an EMA of g² (β₂ = 0.999, as in Adam).
+  - Running ARCs-LSR1 unchanged in the variables x̃ = D^{1/2}x, on g̃ = D^{−1/2}g and the pairs (D^{1/2}s, D^{−1/2}y), is exactly L-SR1 with B₀ = δD, with the cubic term measured in the D-norm. The closed-form shape-changing-norm solution and the δ rule therefore apply as they are.
+  - D is refreshed every step (`--diag_every`). The stored pairs are then rescaled exactly (s̃ ← r s̃, ỹ ← ỹ/r with r = √(D_new/D_old)) and the Gram matrix is recomputed, at O(n m²).
+  - p = 0 is the method of rounds 9–11; p = 1 is an Adam-like diagonal.
+  - Tests (`src/test_math.py`, section 14):
+    - with D fixed, 15 steps equal plain ARCs-LSR1 on f(D^{−1/2}x̃);
+    - after a refresh, the memory equals the raw pairs in the new variables;
+    - B equals the compact L-SR1 with B₀ = δD.
+- **Setup:** F-MNIST CNN, the best configuration of rounds 9–10 at each batch size (δ rule safe_lm; m = 50 + double_grad at batch 256 and 1024, m = 100 at batch 2048 and 4096), p ∈ {0.5, 1}, 3 seeds. At batch 1024 and 4096, μ_min was also retuned for both B₀. Full tables: [results/summary_round12.md](results/summary_round12.md), [fig 17](figures/fig17_diag_b0.png).
+
+| training loss after 10 epochs | δI (reference) | δD, p = 0.5 | δD, p = 1 |
+|---|---|---|---|
+| batch 256 (μ_min = 4) | 0.173 ± 0.002 | 0.172 ± 0.003 | 0.174 ± 0.012 |
+| batch 1024 (μ_min = 1) | 0.195 ± 0.004 | 0.196 ± 0.006 | 0.194 ± 0.012 |
+| batch 2048 (μ_min = 1) | 0.243 ± 0.014 | 0.238 ± 0.010 | 0.251 ± 0.030 |
+| batch 4096 (μ_min = 1) | 0.284 ± 0.017 | 0.276 ± 0.003 | 0.273 ± 0.005 |
+
+| μ_min (p = 1 for δD) | 0.0625 | 0.25 | 1 | 4 |
+|---|---|---|---|---|
+| batch 1024, δI | 0.337 ± 0.038 | 0.228 ± 0.013 | **0.195 ± 0.004** | – |
+| batch 1024, δD | 0.202 ± 0.013 | **0.184 ± 0.008** | 0.194 ± 0.012 | 0.215 ± 0.010 |
+| batch 4096, δI | 0.348 ± 0.019 | 0.331 ± 0.025 | **0.284 ± 0.017** | – |
+| batch 4096, δD | 0.302 ± 0.026 | **0.268 ± 0.011** | 0.273 ± 0.005 | 0.324 ± 0.028 |
+
+**1. The diagonal B₀ helps a little, and only after retuning the floor.**
+- At the round-9 floor the change is within noise, except at batch 4096 (0.284 → 0.273, with a smaller spread).
+- With D, a lower floor works: μ_min = 0.25 is best for δD, while δI gets clearly worse there.
+- Each at its best floor, δD is about 6% better: 0.195 → 0.184 at batch 1024 and 0.284 → 0.268 at batch 4096. The early epochs gain the most (per-epoch ratio down to 0.76 at batch 4096).
+- Batch 256 and 2048 were not retuned.
+
+**2. It does not close the gap to Shampoo and Muon.**
+- At batch 4096 the best ARCs-LSR1 (0.268) is now close to Shampoo (0.248), but still behind Muon (0.189). At batch 1024: 0.184 vs. 0.164 and 0.138.
+- This is expected. With a diagonal B₀, the step outside the L-SR1 subspace becomes a diagonally scaled gradient step without momentum, similar to RMSprop. Shampoo and Muon use the matrix structure of each layer, and Adam (diagonal) is also behind them. The next step is a per-layer Kronecker-factored B₀.
+
+**3. Cost.** Refreshing D every step recomputes the Gram matrix, so the optimizer's arithmetic grows to 8–35% of the model FLOPs (0.2–2% without D). A refresh every 10–50 steps would bring this down, but has not been tested.
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -631,7 +671,7 @@ for xb, yb in loader:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 36 sanity checks (+1 that needs a GPU)
+.venv/bin/python src/test_math.py                       # 39 sanity checks (+1 that needs a GPU)
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
@@ -681,5 +721,8 @@ python3 -m venv .venv
 # GPU / single precision: float32 vs. float64 on the best round-9/10 configurations; CIFAR-10 template
 .venv/bin/python src/check_fp32.py --workers 12
 .venv/bin/python examples/train_cifar10.py --data fake --device cpu --opt arcs --bs 32 --max_steps 3   # smoke test
+# round 12 (diagonal B0 = delta * D, --diag_power; mu_min retuned at batch 1024 / 4096)
+.venv/bin/python src/sweep_round12.py --workers 13
+.venv/bin/python src/analyze_round12.py
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

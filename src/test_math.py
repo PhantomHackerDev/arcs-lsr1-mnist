@@ -396,5 +396,57 @@ if torch.cuda.is_available():  # run on a GPU machine: same results on cuda and 
 else:
     print("[SKIP] cuda == cpu (no GPU on this machine)")
 
+# 14. diagonal B0 (diag_power > 0) = ARCs-LSR1 in the variables x~ = D^{1/2} x --------------------
+torch.manual_seed(14)
+D14 = torch.logspace(-1, 1, n12, dtype=DT)  # ill-conditioned diagonal quadratic
+lg14, lo14 = quad(D14, torch.randn(n12, dtype=DT))
+x0_14 = torch.randn(n12)
+oA = ARCsLSR1(n12, history=4, y_mode="same", diag_power=1.0, diag_every=10 ** 9)  # D fixed after step 1
+xA = x0_14.clone()
+for _ in range(15):
+    oA.step(xA, lg14, lo14)
+sq14 = oA._sq.clone()
+
+
+def lg14t(xt):  # the same problem in the scaled variables, f~(x~) = f(D^{-1/2} x~)
+    f_, g_ = lg14((xt.to(DT) / sq14).float())
+    return f_, (g_.to(DT) / sq14).float()
+
+
+oB = ARCsLSR1(n12, history=4, y_mode="same")
+xB = (x0_14.to(DT) * sq14).float()
+for _ in range(15):
+    oB.step(xB, lg14t, lambda xt: lg14t(xt)[0])
+rel = float((xA.to(DT) - xB.to(DT) / sq14).norm() / xA.norm())
+check("diagonal B0 == plain ARCs-LSR1 on f(D^{-1/2} x~), 15 steps", rel < 1e-4 and oA.blocks[0].k > 0,
+      f"(rel err {rel:.1e}, D in [{float(sq14.min() ** 2):.2f}, {float(sq14.max() ** 2):.2f}])")
+oR = ARCsLSR1(n12, history=4, y_mode="same", delta_mode="const", delta_fallback=0.8)
+d1 = torch.rand(n12, dtype=DT) + 0.5
+d2 = torch.rand(n12, dtype=DT) + 0.5
+oR._sq = d1.sqrt()
+raw = [(torch.randn(n12, dtype=DT), torch.randn(n12, dtype=DT)) for _ in range(3)]
+for s_, y_ in raw:
+    oR._push_pairs(s_, D14 * s_ + 0.1 * y_)
+oR.blocks[0].rescale(d2.sqrt() / oR._sq)
+oR._sq = d2.sqrt()
+St = torch.stack([s_ * d2.sqrt() for s_, _ in raw], 1)
+Yt = torch.stack([(D14 * s_ + 0.1 * y_) / d2.sqrt() for s_, y_ in raw], 1)
+bR = oR.blocks[0]
+Gt = torch.cat([St, Yt], 1).T @ torch.cat([St, Yt], 1)
+idx = bR.order + [j + bR.m for j in bR.order]
+check("diagonal B0: after a refresh of D the memory equals the raw pairs in the new variables",
+      torch.allclose(bR.G[idx][:, idx], Gt, rtol=1e-12, atol=1e-12))
+oR._decompose(bR)
+Sr = torch.stack([s_ for s_, _ in raw], 1)
+Yr = torch.stack([D14 * s_ + 0.1 * y_ for s_, y_ in raw], 1)
+B0 = 0.8 * torch.diag(d2)
+SYr = Sr.T @ Yr
+Ar = torch.diag(torch.diagonal(SYr)) + torch.tril(SYr, -1) + torch.tril(SYr, -1).T
+Pr = Yr - B0 @ Sr
+B_exp = B0 + Pr @ torch.linalg.solve(Ar - Sr.T @ B0 @ Sr, Pr.T)
+B_raw = torch.stack([d2.sqrt() * oR._Bv(bR, d2.sqrt() * e) for e in torch.eye(n12, dtype=DT)], 1)
+check("diagonal B0: B = compact L-SR1 with B0 = delta D in the original variables",
+      torch.allclose(B_raw, B_exp, atol=1e-10), f"(max err {float((B_raw - B_exp).abs().max()):.1e})")
+
 print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

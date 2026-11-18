@@ -202,6 +202,11 @@ def main():
                          "point (reuses the same-batch pair's gradient; no extra cost)")
     ap.add_argument("--double_grad_ratio", action="store_true",
                     help="--double_grad, and the ratio on the two-batch average loss (one extra forward pass)")
+    ap.add_argument("--diag_power", type=float, default=0.0,
+                    help="diagonal initial matrix B0 = delta * D, D = normalized (sqrt(EMA g^2) + eps)^p; 0 = off")
+    ap.add_argument("--diag_beta2", type=float, default=0.999)
+    ap.add_argument("--diag_eps", type=float, default=1e-8)
+    ap.add_argument("--diag_every", type=int, default=1, help="refresh D every this many steps")
     ap.add_argument("--no_pairs", action="store_true",
                     help="ablation: no curvature pairs, B = delta_fallback * I (cubic-regularized gradient step)")
     ap.add_argument("--eta1", type=float, default=0.1)
@@ -277,7 +282,8 @@ def main():
             mu_floor_kappa=a.mu_floor_kappa, eta1=a.eta1, eta2=a.eta2, mu_min=a.mu_min,
             y_batch="rho" if a.y_on_rho else "current", use_pairs=not a.no_pairs,
             double_grad=a.double_grad, double_grad_ratio=a.double_grad_ratio,
-            vec_dtype=getattr(torch, a.vec_dtype), device=dev)
+            vec_dtype=getattr(torch, a.vec_dtype), device=dev, diag_power=a.diag_power, diag_beta2=a.diag_beta2,
+            diag_eps=a.diag_eps, diag_every=a.diag_every)
         gen_rho = torch.Generator().manual_seed(2000 + a.seed)
     else:
         xp = x.clone().requires_grad_(True)

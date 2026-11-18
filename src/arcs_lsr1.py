@@ -138,6 +138,24 @@ class BlockState:
             self.G[:, col] = v[:, c]
             self.G[col, :] = v[:, c]
 
+    def gram(self) -> torch.Tensor:
+        """[S | Y]^T [S | Y] from scratch (float64; row-chunked for a float32 buffer)."""
+        self.flops += 2 * self.buf.shape[0] * self.buf.shape[1] ** 2
+        if self.buf.dtype == DT:
+            return self.buf.T @ self.buf
+        G = torch.zeros_like(self.G)
+        for i in range(0, self.buf.shape[0], self.gram_rows):
+            b = self.buf[i:i + self.gram_rows].to(DT)
+            G += b.T @ b
+        return G
+
+    def rescale(self, r: torch.Tensor):
+        """Change of variables x~ = r * x (elementwise): s~ = r s, y~ = y / r for every stored pair."""
+        m = self.m
+        self.buf[:, :m] *= r[:, None].to(self.buf.dtype)
+        self.buf[:, m:] /= r[:, None].to(self.buf.dtype)
+        self.G = self.gram()
+
     def newest(self):
         j = self.order[-1]
         return self.buf[:, j], self.buf[:, self.m + j]
@@ -186,6 +204,10 @@ class ARCsLSR1:
         double_grad_ratio: bool = False,
         vec_dtype: torch.dtype = DT,
         device=None,
+        diag_power: float = 0.0,
+        diag_beta2: float = 0.999,
+        diag_eps: float = 1e-8,
+        diag_every: int = 1,
     ):
         """mu_per_layer: one mu_l per block, each adapted by its own ratio
                          rho_l = (f(x) - f(x + s_l)) / pred_l, where x + s_l moves
@@ -210,6 +232,12 @@ class ARCsLSR1:
            vec_dtype:    dtype of the parameter-sized arrays (the [S | Y] buffer, g, s, y). float64 (default)
                          reproduces all earlier results; float32 halves the memory, which is 2m x n
                          values for the buffer. The small (2m x 2m) linear algebra is float64 either way.
+           diag_power:   p > 0 uses a diagonal initial matrix B0 = delta * D instead of delta * I, with
+                         D = (sqrt(v_hat) + diag_eps)^p normalized to mean 1, v an EMA (diag_beta2) of g^2 as in
+                         Adam. Implemented as the change of variables x~ = D^{1/2} x: the method runs unchanged
+                         on g~ = D^{-1/2} g and the pairs (D^{1/2} s, D^{-1/2} y), which is L-SR1 with B0 = delta D
+                         and the cubic term in the D-norm. D is refreshed every diag_every steps; the stored pairs
+                         are then rescaled exactly and the Gram matrix recomputed (O(n m^2)). p = 0: off.
            device:       device of the optimizer state (default CPU; ARCsLSR1Optim uses the parameters')
            use_pairs:    False stores no curvature pairs, so B = delta_fallback * I
                          (ablation: cubic regularization without quasi-Newton curvature).
@@ -247,6 +275,10 @@ class ARCsLSR1:
         self.dev = torch.device(device) if device is not None else torch.device("cpu")
         assert vec_dtype == DT or hess_beta == 0, "Hessian momentum is implemented in float64 only"
         self.blocks = [BlockState(a, b, history, delta_fallback, vec_dtype, self.dev) for a, b in blocks]
+        self.diag_power, self.diag_beta2, self.diag_eps, self.diag_every = diag_power, diag_beta2, diag_eps, diag_every
+        assert diag_power == 0 or hess_beta == 0, "diagonal B0 is not implemented with Hessian momentum"
+        self._v = None  # EMA of g^2 (diagonal B0)
+        self._sq = None  # D^{1/2}, the current change of variables
         self.mus = [mu0] * len(self.blocks)  # mus[0] is the shared mu when not per-layer
         self.rho_batch = rho_batch
         self.mu_floor_kappa = mu_floor_kappa
@@ -518,7 +550,30 @@ class ARCsLSR1:
             sb = s[blk.start:blk.end]
             if float(sb.abs().max()) == 0.0:  # block did not move: no curvature pair
                 continue
-            self._add_pair(blk, sb, y[blk.start:blk.end])
+            yb = y[blk.start:blk.end]
+            if self._sq is not None:  # diagonal B0: (s, y) -> (D^{1/2} s, D^{-1/2} y)
+                sq = self._sq[blk.start:blk.end]
+                sb, yb = sb * sq, yb / sq
+            self._add_pair(blk, sb, yb)
+
+    def _diag_update(self, g: torch.Tensor):
+        """EMA of g^2; every diag_every steps a new D = normalized (sqrt(v_hat) + eps)^p, applied to the memory."""
+        b2 = self.diag_beta2
+        if self._v is None:
+            self._v = torch.zeros_like(g)
+        self._v.mul_(b2).addcmul_(g, g, value=1 - b2)
+        if (self.k - 1) % self.diag_every:
+            return
+        vh = self._v / (1 - b2 ** self.k)
+        d = (vh.sqrt() + self.diag_eps) ** self.diag_power
+        d = d / d.mean()
+        sq = d.sqrt()
+        if self._sq is not None:
+            r = sq / self._sq
+            for blk in self.blocks:
+                if blk.k:
+                    blk.rescale(r[blk.start:blk.end])
+        self._sq = sq
 
     def step(self, x: torch.Tensor, loss_and_grad, loss_only, loss_only_val=None, grad_val=None) -> dict:
         """One ARCs-LSR1 iteration on one mini-batch.
@@ -534,6 +589,8 @@ class ARCsLSR1:
         g = g32.to(self.vdt)
         n_grad, n_fwd = 1, 0
         nb = len(self.blocks)
+        if self.diag_power > 0:
+            self._diag_update(g)
 
         # cross-batch pair from the previous iteration (paper / LBFGS-style loop)
         if self.y_mode == "cross" and self._prev_g is not None and self._prev_accepted:
@@ -559,7 +616,12 @@ class ARCsLSR1:
             inf = self._decompose(blk)
             if self.hess_beta > 0:
                 self._momentum(blk)
-            sb, mb, dg = self._block_step(blk, g_model[blk.start:blk.end], mu_used[i])
+            gb = g_model[blk.start:blk.end]
+            if self._sq is not None:
+                gb = gb / self._sq[blk.start:blk.end]
+            sb, mb, dg = self._block_step(blk, gb, mu_used[i])
+            if self._sq is not None:  # s = D^{-1/2} s~ (the model value is invariant)
+                sb = sb / self._sq[blk.start:blk.end]
             inf.update(dg)
             inf["sec_res"] = self._secant_residual(blk)
             infos.append(inf)
@@ -738,6 +800,8 @@ class ARCsLSR1:
         hvp(v_float64) -> H v (float64) on a fixed large probe batch.
         """
         res = {}
+        if self._sq is not None:
+            return res  # not implemented for the diagonal B0
         ss = float(s @ s)
         if ss == 0 or not math.isfinite(ss):
             return res
