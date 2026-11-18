@@ -12,3 +12,6 @@ results_*.log
 # personal files that must never be committed
 *.pdf
 results/overhead_stdout.txt
+# CIFAR-10 sweep: per-run logs and the CPU smoke test are not committed
+results/cifar10/logs/
+results/cifar10_smoke/

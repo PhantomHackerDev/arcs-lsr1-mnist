@@ -577,7 +577,11 @@ Full table: [results/summary_round11.md](results/summary_round11.md), [fig 16](f
 | GPT-2 small (124M) | 9.9 GB | 49.6 GB | 99.2 GB | 99.2 GB |
 
   For GPT-sized models, m = 50–100 does not fit next to the model on one GPU, so those runs need a small m, a per-layer split of the memory across devices, or a structured B₀ that needs fewer pairs.
-- **Template for the larger runs:** [examples/train_cifar10.py](examples/train_cifar10.py) trains ResNet-18 on CIFAR-10 with ARCs-LSR1 (through `ARCsLSR1Optim`), AdamW or SGD on any device. So far it is only smoke-tested on CPU with random data (`--data fake`).
+- **GPU experiments:** [examples/README.md](examples/README.md) has the step-by-step instructions (setup, pre-flight checks, sweep, analysis, sending results back). The first package is CIFAR-10 / ResNet-18:
+  - ARCs-LSR1 (through `ARCsLSR1Optim`) vs. AdamW, SGD and Muon;
+  - Muon for `nn.Module`s with conv weights, checked to match the F-MNIST version exactly;
+  - the same tuning protocol as rounds 9–12, spread over GPUs.
+  - On the development machine (no GPU) the whole pipeline was run end to end only on CPU with random data.
 
 ## Round 12: a diagonal initial matrix B₀ = δD
 
@@ -742,7 +746,8 @@ python3 -m venv .venv
 .venv/bin/python src/analyze_round11.py
 # GPU / single precision: float32 vs. float64 on the best round-9/10 configurations; CIFAR-10 template
 .venv/bin/python src/check_fp32.py --workers 12
-.venv/bin/python examples/train_cifar10.py --data fake --device cpu --opt arcs --bs 32 --max_steps 3   # smoke test
+.venv/bin/python examples/test_examples.py --device cpu                 # pre-flight checks (use --device cuda on a GPU)
+.venv/bin/python examples/sweep_cifar10.py --smoke --gpus cpu --per_gpu 6 && .venv/bin/python examples/analyze_cifar10.py --smoke
 # round 12 (diagonal B0 = delta * D, --diag_power; mu_min retuned at batch 1024 / 4096)
 .venv/bin/python src/sweep_round12.py --workers 13
 .venv/bin/python src/analyze_round12.py
