@@ -42,6 +42,9 @@ Knobs added for the study (defaults reproduce the paper's method)
                           generalized eigenvalue by lam, so delta = delta_prev is
                           again below lambda_hat_min and B >= delta I. By the shift
                           invariance of SR1, B = SR1(B0 = (delta - lam) I) + lam I.
+               'code'   : the rule in the authors' implementation: delta = max(0.5 lambda_hat_min, 1e-6) if
+                          lambda_hat_min > 0, else delta = min(1.5 lambda_hat_min, -1e-6) (a NEGATIVE delta, so
+                          delta < lambda_hat_min and M stays definite, but B0 = delta I is negative definite)
                'bb'     : delta = y^T y / s^T y of the newest pair (clipped)
                'const'  : delta = delta_fallback
   y_mode       'cross'  : y_k = g_{B_{k+1}}(x_{k+1}) - g_{B_k}(x_k)
@@ -326,6 +329,11 @@ class ARCsLSR1:
                 d = self.safe_frac * lam_hat_min
             else:  # 'safe' resets to delta_fallback; 'safe_keep' keeps the previous delta
                 d = self.delta_fallback if mode == "safe" else blk.delta
+        elif mode == "code":  # the rule in the authors' code: delta stays strictly below lambda_hat_min
+            if math.isfinite(lam_hat_min):
+                d = max(self.safe_frac * lam_hat_min, 1e-6) if lam_hat_min > 0 else min(1.5 * lam_hat_min, -1e-6)
+            else:
+                d = blk.delta
         elif mode == "bb":
             s, y = blk.newest()
             sy = float(s @ y)
@@ -334,7 +342,9 @@ class ARCsLSR1:
             d = self.delta_fallback
         else:
             raise ValueError(mode)
-        if mode != "const":
+        if mode == "code":  # may be negative: only the magnitude is bounded
+            d = max(min(d, self.delta_hi), -self.delta_hi)
+        elif mode != "const":
             d = min(max(d, self.delta_lo), self.delta_hi)
         return d, lam_hat_min
 

@@ -619,6 +619,28 @@ Round 9 traced the gap to Shampoo and Muon to the directions outside the L-SR1 s
 
 **3. Cost.** Refreshing D every step recomputes the Gram matrix, so the optimizer's arithmetic grows to 8–35% of the model FLOPs (0.2–2% without D). A refresh every 10–50 steps would bring this down, but has not been tested.
 
+## Round 13: the δ rule of the authors' code
+
+Aditya shared the δ rule of his implementation (`--delta_mode code`): δ = max(0.5 λ̂_min, 1e-6) if λ̂_min > 0, else δ = min(1.5 λ̂_min, −1e-6).
+- When λ̂_min > 0 this is the 'safe' rule used since round 2. Every run here has effectively used the authors' rule in that case; Algorithm 1 in the paper writes δ = λ̂_min, which round 11 found to be the worst choice.
+- When λ̂_min ≤ 0, it takes a **negative** δ below λ̂_min. The middle matrix M stays definite, while B₀ = δI is negative definite and the cubic term controls the step.
+- This is compared with the three alternatives tried so far: reset to δ = 1 ('safe'), keep the previous δ ('safe_keep'), and keep it while LM-damping the pairs ('safe_lm', round 10). The settings are those where λ̂_min ≤ 0 actually happens. F-MNIST CNN, 10 epochs, 3 seeds; full table: [results/summary_round13.md](results/summary_round13.md).
+
+| training loss after 10 epochs | safe (δ = 1) | safe_keep | safe_lm | **code (authors)** | λ̂_min ≤ 0 (% of steps, code) |
+|---|---|---|---|---|---|
+| batch 2048, m = 20 | 0.328 (seed 0) | 0.322 ± 0.023 | 0.312 ± 0.005 | **0.301 ± 0.012** | 3 |
+| batch 2048, m = 50 | 0.408 (seed 0) | 0.259 ± 0.007 | **0.258 ± 0.008** | 0.260 ± 0.006 | 12 |
+| batch 2048, m = 100 | – | 0.305 ± 0.102 | 0.243 ± 0.014 | **0.242 ± 0.015** | 30 |
+| batch 2048, m = 200 | – | 0.477 (seed 0) | **0.238 ± 0.010** | 0.245 ± 0.012 | 33 |
+| batch 1024, m = 50 + double_grad | – | 0.237 ± 0.059 | 0.195 ± 0.004 | **0.193 ± 0.007** | 13 |
+| batch 4096, m = 50 + double_grad | – | 0.335 ± 0.118 | 0.284 ± 0.030 | **0.271 ± 0.009** | 33 |
+
+**1. The authors' rule is as good as the LM damping, and simpler.** The two are within the spread between seeds everywhere except batch 4096 with double_grad, where the authors' rule is better and much less variable (0.271 ± 0.009 vs. 0.284 ± 0.030). Both are far better than resetting δ to 1 or only keeping it.
+
+**2. It also fixes the case round 10 left open.** When λ̂_min stays ≤ 0 for most of the run, 'safe_lm' never re-estimates δ, and one seed out of three degraded. The authors' rule takes δ from the current λ̂_min at every step, so it adapts.
+
+**3. Recommended rule:** the authors' code rule. In both cases it keeps δ strictly below λ̂_min with a margin (0.5 λ̂_min above zero, 1.5 λ̂_min below). Round 11 showed that the margin matters and that its exact size does not. The paper's Algorithm 1 should state this rule rather than δ = λ̂_min.
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -671,7 +693,7 @@ for xb, yb in loader:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 39 sanity checks (+1 that needs a GPU)
+.venv/bin/python src/test_math.py                       # 40 sanity checks (+1 that needs a GPU)
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
@@ -724,5 +746,8 @@ python3 -m venv .venv
 # round 12 (diagonal B0 = delta * D, --diag_power; mu_min retuned at batch 1024 / 4096)
 .venv/bin/python src/sweep_round12.py --workers 13
 .venv/bin/python src/analyze_round12.py
+# round 13 (the delta rule of the authors' code, --delta_mode code, where lambda_hat_min <= 0 happens)
+.venv/bin/python src/sweep_round13.py --workers 13
+.venv/bin/python src/analyze_round13.py
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

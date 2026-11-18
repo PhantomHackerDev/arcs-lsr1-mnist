@@ -246,6 +246,14 @@ check("lambda_hat_min < 0: 'safe' resets to delta_fallback, 'safe_keep' keeps th
       res[0][2] == o_s.delta_fallback and res[1][2] == res[1][0] and res[1][3] < 0,
       f"(safe {res[0][2]:g}, safe_keep {res[1][2]:g}, lambda_hat_min {res[1][3]:g})")
 
+# 10b. delta rule 'code' (the authors' implementation): 0.5 lambda_hat_min if > 0, else 1.5 lambda_hat_min < 0
+o_c = ARCsLSR1(4, history=3, delta_mode="code")
+dc_pos, _ = o_c._choose_delta(o_c.blocks[0], A_pos, St)
+dc_neg, lc_neg = o_c._choose_delta(o_c.blocks[0], A_neg, St)
+check("'code': delta = 0.5 lambda_hat_min if positive, 1.5 lambda_hat_min (negative) otherwise",
+      abs(dc_pos - 0.5) < 1e-9 and abs(dc_neg - 1.5 * lc_neg) < 1e-12 and dc_neg < lc_neg < 0,
+      f"(delta {dc_pos:.3g} / {dc_neg:.3g}, lambda_hat_min {lc_neg:.3g})")
+
 # 11. delta rule 'safe_lm': LM damping of the pairs when lambda_hat_min <= 0 ------------
 torch.manual_seed(11)
 n11, m11 = 8, 3
