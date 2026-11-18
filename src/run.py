@@ -215,6 +215,8 @@ def main():
     ap.add_argument("--history", type=int, default=10)
     ap.add_argument("--mu0", type=float, default=1.0)
     ap.add_argument("--delta_mode", default="safe")
+    ap.add_argument("--safe_frac", type=float, default=0.5,
+                    help="delta = safe_frac * lambda_hat_min in the 'safe*' rules (the paper's Algorithm 1 uses 1)")
     ap.add_argument("--delta_fallback", type=float, default=1.0)
     ap.add_argument("--y_mode", default="cross")
     ap.add_argument("--per_layer", action="store_true")
@@ -261,7 +263,7 @@ def main():
     opt = None
     if a.opt == "arcs":
         opt = ARCsLSR1(
-            N_PARAMS, history=a.history, mu0=a.mu0, delta_mode=a.delta_mode,
+            N_PARAMS, history=a.history, mu0=a.mu0, delta_mode=a.delta_mode, safe_frac=a.safe_frac,
             delta_fallback=a.delta_fallback, y_mode=a.y_mode,
             blocks=LAYER_BLOCKS if a.per_layer else None, grad_beta=a.grad_beta,
             stable_cubic=not a.unstable_cubic, mu_per_layer=a.mu_per_layer,

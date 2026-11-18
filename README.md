@@ -518,6 +518,38 @@ Same setting as round 9: F-MNIST CNN, full network, same-batch y, 10 epochs, 3 s
 - At equal compute (each step costs two gradients), the round-9 picture is unchanged. For example, at batch 1024 AdamW reaches 0.173 and SophiaG 0.156 after 20 epochs.
 - m ≥ 100 combined with double_grad has not been tried yet.
 
+## Round 11: the paper's δ rule (Aditya's question)
+
+Aditya asked whether δ is set as in the paper, δ = λ̂_min, the smallest eigenvalue of the generalized eigenvalue problem (D + L + Lᵀ)u = λ̂ SᵀS u. Since round 2 all runs used δ = ½λ̂_min instead.
+- **Why ½:** M⁻¹ = (D + L + Lᵀ) − δSᵀS is singular at δ = λ̂_min by the definition of λ̂_min (round 1, point 4). Any 0 < δ < λ̂_min keeps B positive definite (Erway et al. 2020), and ½ is one choice in that interval.
+- **Setup:** round 9's setting (F-MNIST CNN, same-batch y, (η₂, μ_min) per batch size), batch 1024 / 2048 / 4096, m ∈ {10, 50, 100}, 3 seeds.
+  - 'paper' is δ = λ̂_min clipped to [1e-4, 1e4], so δ = 1e-4 when λ̂_min ≤ 1e-4.
+  - The fractions c·λ̂_min with c ∈ {0.9, 0.5, 0.25, 0.1} use the LM damping of round 10 when λ̂_min ≤ 0. c = 0.25 and 0.1 were run at m = 10 and 50 only.
+
+Full table: [results/summary_round11.md](results/summary_round11.md), [fig 16](figures/fig16_delta_rule.png). Training loss after 10 epochs:
+
+| batch, m | δ = λ̂_min (paper) | 0.9 λ̂_min | 0.5 λ̂_min | 0.25 λ̂_min | 0.1 λ̂_min |
+|---|---|---|---|---|---|
+| 1024, m = 10 | 0.360 ± 0.016 | 0.346 ± 0.016 | 0.328 ± 0.047 | **0.304 ± 0.008** | 0.309 ± 0.010 |
+| 2048, m = 10 | 0.472 ± 0.031 | 0.433 ± 0.011 | 0.351 ± 0.019 | **0.332 ± 0.026** | **0.332 ± 0.021** |
+| 4096, m = 10 | 0.538 ± 0.039 | 0.522 ± 0.024 | 0.405 ± 0.009 | **0.393 ± 0.021** | 0.400 ± 0.026 |
+| 1024, m = 50 | 0.254 ± 0.015 | 0.241 ± 0.012 | 0.238 ± 0.009 | **0.231 ± 0.004** | 0.235 ± 0.010 |
+| 2048, m = 50 | 0.354 ± 0.064 | 0.284 ± 0.014 | 0.258 ± 0.008 | 0.258 ± 0.007 | **0.257 ± 0.008** |
+| 4096, m = 50 | 0.343 ± 0.015 | 0.309 ± 0.010 | **0.294 ± 0.019** | 0.312 ± 0.017 | 0.310 ± 0.021 |
+| 1024, m = 100 | **0.222 ± 0.012** | 0.225 ± 0.015 | 0.225 ± 0.010 | – | – |
+| 2048, m = 100 | 0.298 ± 0.064 | 0.258 ± 0.019 | **0.243 ± 0.014** | – | – |
+| 4096, m = 100 | 0.297 ± 0.006 | 0.287 ± 0.015 | **0.284 ± 0.017** | – | – |
+
+**1. δ = λ̂_min, as written in Algorithm 1, is the worst choice in 8 of the 9 settings.**
+- At m = 10 the decomposition is numerically singular, as expected: the median cond(M⁻¹) is 5e12–1e13, against 30–70 at ½λ̂_min.
+- At m ≥ 50, λ̂_min ≤ 0 in 65–99% of the steps, so δ sits at the 1e-4 clip most of the time.
+- The exception is batch 1024, m = 100 (0.222 vs. 0.225), where the values are within noise.
+
+**2. Close to λ̂_min is worse; anywhere in 0.1–0.5 is about the same.**
+- 0.9λ̂_min is clearly worse than 0.5λ̂_min at m = 10 (by 5–29%) and at batch 2048 and 4096 for m = 50.
+- Between 0.1 and 0.5 the differences are within the spread between seeds. At m = 10, 0.25 is slightly better than 0.5 at all three batch sizes (by 3–7%); at m = 50 there is no consistent order.
+- **Recommended rule:** δ = c·λ̂_min with c ≈ 0.25–0.5, i.e. strictly inside (0, λ̂_min) with a margin, plus the LM damping of round 10 when λ̂_min ≤ 0.
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -614,5 +646,8 @@ python3 -m venv .venv
 # round 10 (K-BFGS ideas: LM damping in the delta rule 'safe_lm', model gradient over two batches 'double_grad')
 .venv/bin/python src/sweep_round10.py --workers 13
 .venv/bin/python src/analyze_round10.py
+# round 11 (the paper's delta rule delta = lambda_hat_min vs. c * lambda_hat_min, c = 0.9 / 0.5 / 0.25 / 0.1)
+.venv/bin/python src/sweep_round11.py --workers 13
+.venv/bin/python src/analyze_round11.py
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```
