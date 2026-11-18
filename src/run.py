@@ -212,6 +212,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--device", default="cpu", help="cpu, cuda, cuda:N, or auto (cuda if available)")
+    ap.add_argument("--vec_dtype", default="float64", choices=["float64", "float32"],
+                    help="ARCs-LSR1: dtype of the parameter-sized arrays ([S|Y] buffer, g, s, y); "
+                         "float32 halves the optimizer memory (2m x n values)")
     ap.add_argument("--history", type=int, default=10)
     ap.add_argument("--mu0", type=float, default=1.0)
     ap.add_argument("--delta_mode", default="safe")
@@ -235,9 +239,11 @@ def main():
     assert not a.y_on_rho or (a.rho_bs and a.y_mode == "same"), "--y_on_rho needs --rho_bs and --y_mode same"
 
     torch.set_num_threads(a.threads)
+    dev = torch.device("cuda" if a.device == "auto" and torch.cuda.is_available() else
+                       ("cpu" if a.device == "auto" else a.device))
     set_arch(a.arch)
-    Xtr, Ttr, Xte, Tte = load_data(a.data)
-    x = init_params(a.seed)
+    Xtr, Ttr, Xte, Tte = (t.to(dev) for t in load_data(a.data))
+    x = init_params(a.seed).to(dev)
     x0 = x.clone()
 
     def layer_move(xc):
@@ -245,14 +251,14 @@ def main():
         return [float((xc[s:e] - x0[s:e]).norm() / x0[s:e].norm()) for s, e in LAYER_BLOCKS]
     gen = torch.Generator().manual_seed(1000 + a.seed)
     probe_idx = torch.randperm(Xtr.shape[0], generator=torch.Generator().manual_seed(12345))[: a.probe_size]
-    Xp, Tp = Xtr[probe_idx], Ttr[probe_idx]
+    Xp, Tp = Xtr[probe_idx.to(dev)], Ttr[probe_idx.to(dev)]
 
     def hvp(v64):
         xv = x.detach().requires_grad_(True)
         L = loss_fn(xv, Xp, Tp)
         (g,) = torch.autograd.grad(L, xv, create_graph=True)
         (hv,) = torch.autograd.grad(g @ v64.to(g.dtype), xv)
-        return hv.detach().to(torch.float64)
+        return hv.detach().to(v64.dtype)
 
     name = a.tag or (
         f"{a.opt}_bs{a.bs}" + (f"_{a.delta_mode}_{a.y_mode}" + ("_layer" if a.per_layer else "")
@@ -270,7 +276,8 @@ def main():
             hess_beta=a.hess_beta, rank_cap=a.rank_cap, rho_batch=a.rho_batch,
             mu_floor_kappa=a.mu_floor_kappa, eta1=a.eta1, eta2=a.eta2, mu_min=a.mu_min,
             y_batch="rho" if a.y_on_rho else "current", use_pairs=not a.no_pairs,
-            double_grad=a.double_grad, double_grad_ratio=a.double_grad_ratio)
+            double_grad=a.double_grad, double_grad_ratio=a.double_grad_ratio,
+            vec_dtype=getattr(torch, a.vec_dtype), device=dev)
         gen_rho = torch.Generator().manual_seed(2000 + a.seed)
     else:
         xp = x.clone().requires_grad_(True)
@@ -287,7 +294,7 @@ def main():
         else:
             topt = FlatSophiaG(xp, lr=a.lr or 3e-4, wd=a.wd)
 
-    log = {"args": vars(a), "name": name, "iters": [], "probes": [], "epochs": []}
+    log = {"args": vars(a), "name": name, "iters": [], "probes": [], "epochs": [], "device": str(dev)}
     F_FWD, F_FB = model_flops_per_sample()
     log["model_flops_per_sample"] = {"forward": F_FWD, "forward_backward": F_FB}
     tl, ta = evaluate(x, Xtr, Ttr)
@@ -300,7 +307,7 @@ def main():
     for ep in range(1, a.epochs + 1):
         perm = torch.randperm(Xtr.shape[0], generator=gen)
         for bi in range(0, Xtr.shape[0] - a.bs + 1, a.bs):
-            idx = perm[bi:bi + a.bs]
+            idx = perm[bi:bi + a.bs].to(dev)
             Xb, Tb = Xtr[idx], Ttr[idx]
             it += 1
             if opt is not None:
@@ -309,13 +316,13 @@ def main():
                 if a.rho_batch == "next":
                     # the next mini-batch in this epoch's order (wraps to the first)
                     nb_ = bi + a.bs if bi + 2 * a.bs <= Xtr.shape[0] else 0
-                    vidx = perm[nb_:nb_ + a.bs]
+                    vidx = perm[nb_:nb_ + a.bs].to(dev)
                     lo_val = make_closures(Xtr[vidx], Ttr[vidx])[1]
                 elif a.rho_batch == "large":
                     # the current batch plus rho_bs - bs random samples from outside it
                     j = torch.randperm(Xtr.shape[0] - a.bs, generator=gen_rho)[: a.rho_bs - a.bs]
                     j = torch.where(j >= bi, j + a.bs, j)
-                    vidx = torch.cat([idx, perm[j]])
+                    vidx = torch.cat([idx, perm[j].to(dev)])
                     lg_val, lo_val = make_closures(Xtr[vidx], Ttr[vidx])
                 d = opt.step(x, lg, lo, lo_val, lg_val)
                 n_grad += d["n_grad"]

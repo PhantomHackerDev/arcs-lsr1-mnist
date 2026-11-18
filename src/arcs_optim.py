@@ -27,7 +27,9 @@ Closure contract (as for torch.optim.LBFGS, plus one keyword):
 For rho_batch="next", pass closure_val (same contract, another batch).
 
 Parameter groups define the blocks when per_layer=True. All keyword
-arguments other than per_layer go to ARCsLSR1 (see arcs_lsr1.py).
+arguments other than per_layer go to ARCsLSR1 (see arcs_lsr1.py); the
+optimizer state lives on the parameters' device unless device= is given, and
+vec_dtype=torch.float32 halves its memory (2m x n values for the L-SR1 buffer).
 Limitation: state_dict() does not include the L-SR1 memory.
 """
 from __future__ import annotations
@@ -50,6 +52,7 @@ class ARCsLSR1Optim(torch.optim.Optimizer):
             n = sum(p.numel() for p in g["params"])
             blocks.append((i, i + n))
             i += n
+        kwargs.setdefault("device", self._params[0].device)
         self.core = ARCsLSR1(i, blocks=blocks if per_layer else None, **kwargs)
         self.last_info: dict = {}
 

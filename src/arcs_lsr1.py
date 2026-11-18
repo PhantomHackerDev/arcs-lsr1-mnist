@@ -91,11 +91,14 @@ def cubic_1d_value(g, lam, s, mu):
 class BlockState:
     """L-SR1 memory and current eigen-decomposition for one parameter block."""
 
-    def __init__(self, start: int, end: int, m: int, delta: float):
+    def __init__(self, start: int, end: int, m: int, delta: float, vec_dtype=DT, device=None):
         self.start, self.end, self.m = start, end, m
         nb = end - start
-        self.buf = torch.zeros(nb, 2 * m, dtype=DT)  # [S | Y] slots
-        self.G = torch.zeros(2 * m, 2 * m, dtype=DT)  # Gram of buf
+        # the n_b x 2m buffer is the only large array; with vec_dtype=float32 it is stored in single
+        # precision, while the 2m x 2m Gram matrix and all small linear algebra stay in float64
+        self.buf = torch.zeros(nb, 2 * m, dtype=vec_dtype, device=device)  # [S | Y] slots
+        self.G = torch.zeros(2 * m, 2 * m, dtype=DT, device=device)  # Gram of buf
+        self.gram_rows = max(1, (1 << 22) // (2 * m))  # row chunk for the float64 Gram update (float32 buffer)
         self.order: list[int] = []  # slots, oldest -> newest
         self.delta = delta
         # current decomposition: U_par = buf @ Wfull, eigenvalues delta + lam_hat
@@ -122,7 +125,14 @@ class BlockState:
         self.order.append(j)
         self.buf[:, j] = s
         self.buf[:, m + j] = y
-        v = self.buf.T @ torch.stack([s, y], 1)  # (2m, 2)
+        if self.buf.dtype == DT:
+            v = self.buf.T @ torch.stack([s, y], 1)  # (2m, 2)
+        else:  # single-precision buffer: accumulate the Gram columns in float64, in row chunks
+            sy = torch.stack([self.buf[:, j], self.buf[:, m + j]], 1)
+            v = torch.zeros(2 * m, 2, dtype=DT, device=self.buf.device)
+            r = self.gram_rows
+            for i in range(0, self.buf.shape[0], r):
+                v += self.buf[i:i + r].to(DT).T @ sy[i:i + r].to(DT)
         self.flops += 2 * self.buf.shape[0] * self.buf.shape[1] * 2
         for col, c in ((j, 0), (m + j, 1)):
             self.G[:, col] = v[:, c]
@@ -133,13 +143,13 @@ class BlockState:
         return self.buf[:, j], self.buf[:, self.m + j]
 
     # U_par products without forming U_par
-    def Ut(self, v):
+    def Ut(self, v):  # n_b-vector (buffer dtype) -> r-vector (float64)
         self.flops += 2 * self.buf.shape[0] * self.buf.shape[1]
-        return self.Wfull.T @ (self.buf.T @ v)
+        return self.Wfull.T @ (self.buf.T @ v).to(DT)
 
-    def U(self, z):
+    def U(self, z):  # r-vector (float64) -> n_b-vector (buffer dtype)
         self.flops += 2 * self.buf.shape[0] * self.buf.shape[1]
-        return self.buf @ (self.Wfull @ z)
+        return self.buf @ (self.Wfull @ z).to(self.buf.dtype)
 
 
 class ARCsLSR1:
@@ -174,6 +184,8 @@ class ARCsLSR1:
         use_pairs: bool = True,
         double_grad: bool = False,
         double_grad_ratio: bool = False,
+        vec_dtype: torch.dtype = DT,
+        device=None,
     ):
         """mu_per_layer: one mu_l per block, each adapted by its own ratio
                          rho_l = (f(x) - f(x + s_l)) / pred_l, where x + s_l moves
@@ -195,6 +207,10 @@ class ARCsLSR1:
                          Needs y_mode='same' and the full-network path.
            double_grad_ratio: also measure the ratio on the average of the two
                          batches' losses (one extra forward pass on the previous batch).
+           vec_dtype:    dtype of the parameter-sized arrays (the [S | Y] buffer, g, s, y). float64 (default)
+                         reproduces all earlier results; float32 halves the memory, which is 2m x n
+                         values for the buffer. The small (2m x 2m) linear algebra is float64 either way.
+           device:       device of the optimizer state (default CPU; ARCsLSR1Optim uses the parameters')
            use_pairs:    False stores no curvature pairs, so B = delta_fallback * I
                          (ablation: cubic regularization without quasi-Newton curvature).
            y_batch:      'current' : same-batch pairs use the current batch;
@@ -227,7 +243,10 @@ class ARCsLSR1:
         self.rank_tol = rank_tol
         if blocks is None:
             blocks = [(0, n_params)]
-        self.blocks = [BlockState(a, b, history, delta_fallback) for a, b in blocks]
+        self.vdt = vec_dtype
+        self.dev = torch.device(device) if device is not None else torch.device("cpu")
+        assert vec_dtype == DT or hess_beta == 0, "Hessian momentum is implemented in float64 only"
+        self.blocks = [BlockState(a, b, history, delta_fallback, vec_dtype, self.dev) for a, b in blocks]
         self.mus = [mu0] * len(self.blocks)  # mus[0] is the shared mu when not per-layer
         self.rho_batch = rho_batch
         self.mu_floor_kappa = mu_floor_kappa
@@ -260,7 +279,7 @@ class ARCsLSR1:
         lam_hat_min = float("nan")
         try:
             ridge = 1e-12 * float(StS.diagonal().mean())
-            Lc = torch.linalg.cholesky(StS + ridge * torch.eye(k, dtype=DT))
+            Lc = torch.linalg.cholesky(StS + ridge * torch.eye(k, dtype=DT, device=StS.device))
             Li = torch.linalg.inv(Lc)
             Cm = Li @ A @ Li.T
             lam_hat_min = float(torch.linalg.eigvalsh(0.5 * (Cm + Cm.T))[0])
@@ -296,7 +315,7 @@ class ARCsLSR1:
             info["delta"] = blk.delta
             return info
         m = blk.m
-        Si = torch.tensor(blk.order)
+        Si = torch.tensor(blk.order, device=blk.G.device)
         Yi = Si + m
         G = blk.G
         StS = G[Si][:, Si]
@@ -347,7 +366,7 @@ class ARCsLSR1:
             blk.Wfull, blk.lam_hat = None, None
             return info
         W = (V / sig.sqrt()) @ P  # U_par = Psi W   (k x r)
-        Wfull = torch.zeros(2 * m, W.shape[1], dtype=DT)
+        Wfull = torch.zeros(2 * m, W.shape[1], dtype=DT, device=W.device)
         Wfull[Yi] = W
         Wfull[Si] = -d_psi * W
         blk.Wfull, blk.lam_hat = Wfull, lam_hat
@@ -387,8 +406,8 @@ class ARCsLSR1:
             blk.flops += 2 * blk.buf.shape[0] * blk.buf.shape[1] * blk.Wfull.shape[1]
             lam_new = blk.lam_hat
         else:
-            U_new = torch.zeros(blk.end - blk.start, 0, dtype=DT)
-            lam_new = torch.zeros(0, dtype=DT)
+            U_new = torch.zeros(blk.end - blk.start, 0, dtype=DT, device=self.dev)
+            lam_new = torch.zeros(0, dtype=DT, device=self.dev)
         if blk.V is None:
             blk.V, blk.lamV, blk.gV = U_new, lam_new, blk.delta
             return
@@ -465,7 +484,8 @@ class ARCsLSR1:
         if self.hess_beta > 0 and blk.V is not None:
             Bs = blk.gV * s + (blk.V @ (blk.lamV * (blk.V.T @ s)) if blk.V.shape[1] else 0.0)
         elif blk.Wfull is not None:
-            Bs = blk.delta * s + blk.buf @ (blk.Wfull @ (blk.lam_hat * (blk.Wfull.T @ (blk.buf.T @ s))))
+            Bs = blk.delta * s + blk.buf @ (blk.Wfull @ (blk.lam_hat * (blk.Wfull.T @ (blk.buf.T @ s).to(DT)))).to(
+                blk.buf.dtype)
         else:
             Bs = blk.delta * s
         return float((Bs - y).norm() / y.norm())
@@ -511,7 +531,7 @@ class ARCsLSR1:
         """
         self.k += 1
         f0, g32 = loss_and_grad(x)
-        g = g32.to(DT)
+        g = g32.to(self.vdt)
         n_grad, n_fwd = 1, 0
         nb = len(self.blocks)
 
@@ -588,12 +608,12 @@ class ARCsLSR1:
                 x_trial = x + s_take.to(x.dtype)
                 if y_val:
                     f1, gv1 = grad_val(x_trial)  # y and ratio on the ratio batch
-                    y_same = gv1.to(DT) - gv0.to(DT)
+                    y_same = gv1.to(self.vdt) - gv0.to(self.vdt)
                     n_grad += 1
                 else:
                     if self.y_mode == "same":
                         f1, g1_32 = loss_and_grad(x_trial)  # y on the current batch
-                        y_same = g1_32.to(DT) - g
+                        y_same = g1_32.to(self.vdt) - g
                         n_grad += 1
                     if use_val:
                         f1 = loss_only_val(x_trial)
@@ -645,12 +665,12 @@ class ARCsLSR1:
                 # y and both ratio values on the ratio batch
                 f0_t, gv0 = grad_val(x)
                 f1, gv1 = grad_val(x_trial)
-                y_same = gv1.to(DT) - gv0.to(DT)
+                y_same = gv1.to(self.vdt) - gv0.to(self.vdt)
                 n_grad += 2
             else:
                 if self.y_mode == "same":
                     f1, g1_32 = loss_and_grad(x_trial)
-                    y_same = g1_32.to(DT) - g
+                    y_same = g1_32.to(self.vdt) - g
                     n_grad += 1
                 if self.double_grad_ratio and self._lo_next is not None:
                     # ratio of the two-batch average loss, the function g_model belongs to
@@ -672,7 +692,7 @@ class ARCsLSR1:
                     f1 = f1_cur
                 ok = finite_step and y_same is not None
                 # this batch's gradient and loss at the next iterate, for the next step
-                self._g_next = (g1_32.to(DT) if accepted else g) if ok else None
+                self._g_next = (g1_32.to(self.vdt) if accepted else g) if ok else None
                 self._f_next = (f1 if accepted else f0) if ok else None
                 self._lo_next = loss_only if ok else None
             self.mus = [self._mu_next(self.mus[0], rho)] * nb
@@ -735,8 +755,8 @@ class ARCsLSR1:
                 best = (float(lam[i]), b, i)
         if best is not None:
             lam_val, b, i = best
-            u = torch.zeros(self.n, dtype=DT)
-            u[b.start:b.end] = b.buf @ b.Wfull[:, i]
+            u = torch.zeros(self.n, dtype=self.vdt, device=self.dev)
+            u[b.start:b.end] = b.buf @ b.Wfull[:, i].to(b.buf.dtype)
             u = u / u.norm()
             res["lamB_neg"] = lam_val
             res["qH_neg"] = float(u @ hvp(u))

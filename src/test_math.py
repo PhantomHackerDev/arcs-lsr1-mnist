@@ -339,5 +339,62 @@ check("double_grad: model gradient = (g_B_k(x_k) + g_B_{k-1}(x_k)) / 2, after ac
       grad_ok and 0 in accs[:-1] and 1 in accs[:-1], f"(accepted: {accs})")
 check("double_grad_ratio: rho is measured on the two-batch average loss", rho_ok)
 
+# 13. single-precision buffers (vec_dtype=float32) and devices ------------------------------
+torch.manual_seed(13)
+n13, m13 = 50, 6
+H13 = torch.randn(n13, n13, dtype=DT)
+H13 = 0.5 * (H13 + H13.T)
+P13 = [(s_, H13 @ s_ + 0.01 * torch.randn(n13, dtype=DT)) for s_ in torch.randn(m13 + 2, n13, dtype=DT)]
+
+
+def filled(vdt, rows=None, dev=None):
+    o = ARCsLSR1(n13, history=m13, vec_dtype=vdt, device=dev)
+    b = o.blocks[0]
+    if rows:
+        b.gram_rows = rows
+    for s_, y_ in P13:
+        b.push(s_.to(vdt).to(b.buf.device), y_.to(vdt).to(b.buf.device))
+    return o, b
+
+
+o32, b32 = filled(torch.float32, rows=7)  # 8 row chunks: exercises the chunked float64 Gram update
+G_ref = b32.buf.to(DT).T @ b32.buf.to(DT)
+check("float32 buffer: Gram (chunked float64 accumulation) == float64 Gram of the stored values",
+      b32.buf.dtype == torch.float32 and b32.G.dtype == DT and
+      torch.allclose(b32.G, G_ref, rtol=1e-12, atol=1e-12 * float(G_ref.abs().max())))
+o64, b64 = filled(DT)
+o32._decompose(b32)
+o64._decompose(b64)
+V13 = torch.randn(n13, 4, dtype=DT)
+Bv64 = torch.stack([o64._Bv(b64, V13[:, j]) for j in range(4)], 1)
+Bv32 = torch.stack([o32._Bv(b32, V13[:, j].float()) for j in range(4)], 1).to(DT)
+rel = float((Bv32 - Bv64).norm() / Bv64.norm())
+check("float32 buffer: B v agrees with float64 to single precision", rel < 1e-4, f"(rel err {rel:.1e})")
+g13 = torch.randn(n13, dtype=DT)
+s64 = o64._block_step(b64, g13)[0]
+s32 = o32._block_step(b32, g13.float())[0]
+rel = float((s32.to(DT) - s64).norm() / s64.norm())
+check("float32 buffer: cubic step agrees with float64 to single precision", s32.dtype == torch.float32 and rel < 1e-4,
+      f"(rel err {rel:.1e})")
+traj = {}
+for vdt in (DT, torch.float32):  # 25 steps on a quadratic: same trajectory up to single precision
+    torch.manual_seed(14)
+    lgq, loq = quad(D12, torch.randn(n12, dtype=DT))
+    xq_ = torch.randn(n12)
+    oq_ = ARCsLSR1(n12, history=4, y_mode="same", vec_dtype=vdt)
+    for _ in range(25):
+        oq_.step(xq_, lgq, loq)
+    traj[vdt] = (xq_.clone(), loq(xq_))
+rel = float((traj[DT][0] - traj[torch.float32][0]).norm() / traj[DT][0].norm())
+check("float32 buffer: 25-step trajectory matches float64", rel < 1e-4, f"(rel err {rel:.1e}, f {traj[DT][1]:.3e} vs "
+      f"{traj[torch.float32][1]:.3e})")
+if torch.cuda.is_available():  # run on a GPU machine: same results on cuda and cpu
+    oc, bc = filled(DT, dev="cuda")
+    oc._decompose(bc)
+    Bvc = torch.stack([oc._Bv(bc, V13[:, j].cuda()) for j in range(4)], 1).cpu()
+    check("cuda == cpu (float64 state)", bc.buf.is_cuda and torch.allclose(Bvc, Bv64, rtol=1e-10, atol=1e-12))
+else:
+    print("[SKIP] cuda == cpu (no GPU on this machine)")
+
 print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

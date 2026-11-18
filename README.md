@@ -550,6 +550,35 @@ Full table: [results/summary_round11.md](results/summary_round11.md), [fig 16](f
 - Between 0.1 and 0.5 the differences are within the spread between seeds. At m = 10, 0.25 is slightly better than 0.5 at all three batch sizes (by 3–7%); at m = 50 there is no consistent order.
 - **Recommended rule:** δ = c·λ̂_min with c ≈ 0.25–0.5, i.e. strictly inside (0, λ̂_min) with a margin, plus the LM damping of round 10 when λ̂_min ≤ 0.
 
+## GPU and single precision (preparation for the large experiments)
+
+- **Device.** `ARCsLSR1(..., device=...)` keeps the optimizer state on that device; `ARCsLSR1Optim` uses the parameters' device by default. `src/run.py --device cuda` (or `auto`) moves the data, the model and the optimizer state, and also works for the baselines.
+- **Single precision.** `vec_dtype=torch.float32` (`--vec_dtype float32`) stores the [S | Y] buffer and all parameter-sized vectors (g, s, y) in float32. The 2m × 2m Gram matrix and all small linear algebra (eigendecompositions, λ̂_min, the cubic solution in the eigenbasis) stay in float64, and new Gram columns are accumulated in float64 in row chunks. The default (float64, CPU) reproduces every earlier result bitwise (checked against stored runs of ARCs-LSR1 and Muon).
+- **Tests** (`src/test_math.py`, section 13):
+  - the chunked float64 Gram equals the float64 Gram of the stored float32 values;
+  - B v and the cubic step agree with float64 to single precision (relative error ~1e-7);
+  - a 25-step trajectory agrees with float64.
+  - A cuda-vs-cpu check runs automatically on a machine with a GPU. **It has not been run yet: this machine has no GPU.**
+- **Training check** ([results/summary_fp32.md](results/summary_fp32.md)): the four best configurations of rounds 9–10, 3 seeds each. float32 and float64 agree within the spread between seeds; individual seeds differ by up to 0.013 because the trajectories diverge.
+
+| F-MNIST, training loss after 10 epochs | float64 | float32 |
+|---|---|---|
+| batch 256, m = 50, safe_lm + double_grad | 0.173 ± 0.002 | 0.172 ± 0.013 |
+| batch 1024, m = 50, safe_lm + double_grad | 0.195 ± 0.004 | 0.197 ± 0.006 |
+| batch 2048, m = 100, safe_lm | 0.243 ± 0.014 | 0.242 ± 0.014 |
+| batch 4096, m = 100 | 0.284 ± 0.017 | 0.283 ± 0.011 |
+
+- **Memory.** The L-SR1 buffer holds 2m × n values, so it dominates at scale:
+
+| model (parameters) | m = 10, float32 | m = 50, float32 | m = 50, float64 | m = 100, float32 |
+|---|---|---|---|---|
+| ResNet-18, CIFAR-10 (11.2M) | 0.9 GB | 4.5 GB | 9.0 GB | 9.0 GB |
+| ResNet-50, ImageNet (25.6M) | 2.0 GB | 10.2 GB | 20.5 GB | 20.5 GB |
+| GPT-2 small (124M) | 9.9 GB | 49.6 GB | 99.2 GB | 99.2 GB |
+
+  For GPT-sized models, m = 50–100 does not fit next to the model on one GPU, so those runs need a small m, a per-layer split of the memory across devices, or a structured B₀ that needs fewer pairs.
+- **Template for the larger runs:** [examples/train_cifar10.py](examples/train_cifar10.py) trains ResNet-18 on CIFAR-10 with ARCs-LSR1 (through `ARCsLSR1Optim`), AdamW or SGD on any device. So far it is only smoke-tested on CPU with random data (`--data fake`).
+
 ## Using it as a `torch.optim` optimizer
 
 `src/arcs_optim.py` wraps the method as a `torch.optim.Optimizer`. It uses the same closure pattern as `torch.optim.LBFGS`, and `src/test_optim.py` checks that it reproduces the functional implementation used in all experiments bitwise.
@@ -602,7 +631,7 @@ for xb, yb in loader:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python src/test_math.py                       # 32 sanity checks
+.venv/bin/python src/test_math.py                       # 36 sanity checks (+1 that needs a GPU)
 # round 1 (paper's 2-layer net), ~2-3 h on 16 CPU cores
 .venv/bin/python src/grid.py --only paper_cross,safe_cross,safe_same,safe_cross_layer,safe_same_layer,sgd,adam
 .venv/bin/python src/analyze.py                         # results/summary.md, figures/fig1-4
@@ -649,5 +678,8 @@ python3 -m venv .venv
 # round 11 (the paper's delta rule delta = lambda_hat_min vs. c * lambda_hat_min, c = 0.9 / 0.5 / 0.25 / 0.1)
 .venv/bin/python src/sweep_round11.py --workers 13
 .venv/bin/python src/analyze_round11.py
+# GPU / single precision: float32 vs. float64 on the best round-9/10 configurations; CIFAR-10 template
+.venv/bin/python src/check_fp32.py --workers 12
+.venv/bin/python examples/train_cifar10.py --data fake --device cpu --opt arcs --bs 32 --max_steps 3   # smoke test
 .venv/bin/python src/analyze_followup.py                # results/summary_followup.md, figures/fig5-7
 ```

@@ -67,9 +67,9 @@ def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7, dtype=tor
 class _AdamState:
     """Elementwise Adam moments for one segment (used directly or for grafting)."""
 
-    def __init__(self, n, betas=(0.9, 0.999), eps=1e-8):
-        self.m = torch.zeros(n)
-        self.v = torch.zeros(n)
+    def __init__(self, n, betas=(0.9, 0.999), eps=1e-8, device=None):
+        self.m = torch.zeros(n, device=device)
+        self.v = torch.zeros(n, device=device)
         self.b1, self.b2 = betas
         self.eps = eps
 
@@ -90,8 +90,8 @@ class FlatMuon:
         last_w = max(k for k, (_, _, sh) in enumerate(segs) if len(sh) >= 2)
         self.muon = [(s, e, sh) for k, (s, e, sh) in enumerate(segs) if len(sh) >= 2 and k != last_w]
         self.aux = [(s, e, sh) for k, (s, e, sh) in enumerate(segs) if not (len(sh) >= 2 and k != last_w)]
-        self.buf = {s: torch.zeros(e - s) for s, e, _ in self.muon}
-        self.adam = {s: _AdamState(e - s) for s, e, _ in self.aux}
+        self.buf = {s: torch.zeros(e - s, device=xp.device) for s, e, _ in self.muon}
+        self.adam = {s: _AdamState(e - s, device=xp.device) for s, e, _ in self.aux}
         self.t = 0
 
     def zero_grad(self):
@@ -122,13 +122,14 @@ class FlatShampoo:
         self.xp, self.lr, self.wd, self.T, self.damp = xp, lr, wd, precond_every, damping
         self.b1, self.b2 = betas
         self.segs = segments(shapes)
-        self.adam = {s: _AdamState(e - s, betas) for s, e, _ in self.segs}
+        self.adam = {s: _AdamState(e - s, betas, device=xp.device) for s, e, _ in self.segs}
         self.mats = {}
         for s, e, sh in self.segs:
             if len(sh) >= 2:
                 r, c = sh[0], math.prod(sh[1:])
                 if max(r, c) <= max_dim:
-                    self.mats[s] = {"L": torch.zeros(r, r), "R": torch.zeros(c, c), "Li": None, "Ri": None}
+                    self.mats[s] = {"L": torch.zeros(r, r, device=xp.device), "R": torch.zeros(c, c, device=xp.device),
+                                    "Li": None, "Ri": None}
         self.t = 0
 
     def zero_grad(self):
@@ -169,8 +170,8 @@ class FlatSophiaG:
         self.xp, self.lr, self.rho, self.wd, self.k = xp, lr, rho, wd, k
         self.b1, self.b2 = betas
         n = xp.numel()
-        self.m = torch.zeros(n)
-        self.h = torch.zeros(n)
+        self.m = torch.zeros(n, device=xp.device)
+        self.h = torch.zeros(n, device=xp.device)
         self.t = 0
 
     def zero_grad(self):
